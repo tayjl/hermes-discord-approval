@@ -38,6 +38,17 @@ hermes gateway restart
 
 Do not enable the plugin in other profiles.
 
+### Recommended setting
+
+A question card expires when the clarify timeout ends. The default is 90 seconds, which is often too short to notice a phone notification. Raise it to 300 seconds, then restart the gateway:
+
+```
+hermes config set agent.clarify_timeout 300
+hermes gateway restart
+```
+
+The turn waits up to that long for an answer.
+
 ## What you get
 
 - **Approvals.** With away on, a flagged command shows a DM card with Allow once, Allow for this session and Deny. There is no "always" button. An unanswered card is denied after the timeout. The card also warns you if a command was cut short or has hidden secrets or odd characters.
