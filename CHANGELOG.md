@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- New `channel` setting: post cards and pings to a server channel instead of your DM, with an @mention of you (first message of a batch only). Empty keeps the DM. Falls back to the DM, with one warning, if the channel can't be used. Only you can be pinged. A batch never splits between channel and DM. Settling a card by click keeps the mention and still blocks @everyone and roles. Cards keep 24 characters free for the mention.
+
 ## 1.0.0
 
 - Branded Hermes Discord Approval everywhere. Command replies use the same header as approval cards.

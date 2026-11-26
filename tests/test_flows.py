@@ -204,10 +204,10 @@ def test_connection_not_ready_raises(monkeypatch):
 def test_failed_send_raises_and_leaves_nothing_pending(monkeypatch):
     _, fake, present = _setup(monkeypatch)
 
-    def boom(text, buttons=()):
+    def boom(text, buttons=(), **_):
         raise RuntimeError("discord down")
 
-    monkeypatch.setattr(connection, "send_dm", boom)
+    monkeypatch.setattr(connection, "send", boom)
     try:
         present(_req())
         assert False, "expected RuntimeError"
@@ -326,13 +326,13 @@ def test_slow_ready_and_send_count_against_the_deadline(monkeypatch):
         now[0] += 5
         return now[0] - 5
 
-    async def slow_send(text, buttons=(), select=None):
+    async def slow_send(text, buttons=(), select=None, **_):
         now[0] += 8
         fake.sent.append((text, list(buttons)))
         return 1
 
     monkeypatch.setattr(flows, "monotonic", clock)
-    monkeypatch.setattr(connection, "send_dm", slow_send)
+    monkeypatch.setattr(connection, "send", slow_send)
     monkeypatch.setattr(connection, "ready", lambda timeout: now.__setitem__(0, now[0] + 8))
     decision = present(_req(timeout_seconds=40))  # window 25 s from the start
     assert decision.choice == "deny"
@@ -515,10 +515,10 @@ def test_a_subagent_approval_that_cannot_be_found_falls_back_to_the_waiting_noti
 def test_a_first_dm_that_fails_leaves_nothing_registered(monkeypatch):
     _, fake, _, notice, _ = _notice(monkeypatch)
 
-    async def down(text, buttons=(), select=None):
+    async def down(text, buttons=(), select=None, **_):
         raise RuntimeError("discord down")
 
-    monkeypatch.setattr(connection, "send_dm", down)
+    monkeypatch.setattr(connection, "send", down)
     notice(session_id="s1", kind="approval", prompt_id="p")
     assert flows._questions == {}
 
@@ -548,7 +548,7 @@ def test_a_failed_card_edit_after_a_click_still_takes_the_buttons_off(monkeypatc
     run = Running(present, _req())
     _wait(lambda: fake.sent)
 
-    async def refuse(content, view="unset"):
+    async def refuse(content, view="unset", allowed_mentions=None):
         raise RuntimeError("discord down")
 
     i = interaction(_custom_id(fake, "once"))

@@ -411,14 +411,14 @@ def test_a_click_on_a_batch_card_keeps_its_layout(monkeypatch):
 
 def test_a_failed_send_partway_still_lets_the_cards_sent_settle(monkeypatch):
     fake, on_prompt, on_settled = _hooks(monkeypatch)
-    real = fake.send_dm
+    real = fake.send
 
-    async def flaky(text, buttons=(), select=None):
+    async def flaky(text, buttons=(), select=None, **_):
         if len(fake.sent) == 1:
             raise RuntimeError("discord down")
         return await real(text, buttons, select)
 
-    monkeypatch.setattr(flows.connection, "send_dm", flaky)
+    monkeypatch.setattr(flows.connection, "send", flaky)
     _batch(on_prompt, "srq-a", _q("q0", "one"), _q("q1", "two"), _q("q2", "three"))
     assert len(fake.sent) == 1  # order is strict: nothing after the failure was sent
     on_settled(prompt_id="srq-a")

@@ -191,8 +191,11 @@ def submit(coro):
     return future
 
 
-async def send_dm(text, buttons=(), select=None):
-    """DM the user. buttons: (label, custom_id, style name) tuples. select: (placeholder, custom_id, [(label, value)]), pick one or more. Returns the message."""
+async def send(text, buttons=(), select=None, channel="", mention=False, route=None):
+    """Post a card. buttons: (label, custom_id, style name) tuples. select: (placeholder, custom_id, [(label, value)]), pick one or more.
+    With a channel id, post there (mention: prefix an @ of the owner, the only ping allowed). If that fails, or with no channel, DM the user.
+    route: a dict shared by one batch; after a failure it holds "dm" so the rest of the batch stays in the DM and warns once. Returns the message."""
+    route = {} if route is None else route
     view = discord.ui.View(timeout=None)
     if select:
         placeholder, select_id, options = select
@@ -201,13 +204,40 @@ async def send_dm(text, buttons=(), select=None):
             options=[discord.SelectOption(label=label, value=value) for label, value in options]))
     for label, custom_id, style in buttons:
         view.add_item(discord.ui.Button(label=label, custom_id=custom_id, style=getattr(discord.ButtonStyle, style)))
-    user = await get().client.fetch_user(int(user_id()))  # type: ignore[union-attr, arg-type]
+    client = get().client
+    if channel and not route.get("dm"):
+        try:
+            target = await client.fetch_channel(int(channel))  # type: ignore[union-attr]
+            return await target.send(f"{mention_prefix()}{text}" if mention else text, view=view, allowed_mentions=_allowed_mentions())
+        except Exception as e:
+            # A card must never be lost: the DM below is the fallback. Type only, as elsewhere.
+            route["dm"] = True
+            logger.warning("discord-approval: cannot post to the channel (%s), sending a DM instead", type(e).__name__)
+    user = await client.fetch_user(int(user_id()))  # type: ignore[union-attr, arg-type]
     return await user.send(text, view=view)
 
 
+def mention_prefix():
+    return f"<@{user_id()}>\n"
+
+
+def _allowed_mentions():
+    """Only the owner can be pinged: command or log text in a card must not reach @everyone or a role."""
+    return discord.AllowedMentions(users=[discord.Object(id=int(user_id()))], everyone=False, roles=False, replied_user=False)  # type: ignore[arg-type]
+
+
+async def edit_in_place(interaction, text):
+    """The interaction edit that settles a card: text is built from interaction.message.content, which already holds the owner mention
+    (once). Mentions are re-parsed on every edit, so the same allowed_mentions applies as on send."""
+    await interaction.response.edit_message(content=text, view=None, allowed_mentions=_allowed_mentions())
+
+
 async def edit_card(message, text):
-    """Final state of a card: new text, buttons removed."""
-    await message.edit(content=text, view=None)
+    """Final state of a card: new text, buttons removed. A channel card keeps its mention (an unchanged one doesn't ping again)."""
+    prefix = mention_prefix()
+    if (message.content or "").startswith(prefix) and not text.startswith(prefix):
+        text = prefix + text
+    await message.edit(content=text, view=None, allowed_mentions=_allowed_mentions())
 
 
 def stop():
@@ -222,7 +252,7 @@ async def close_card(interaction):
     """Final state for an unknown or finished request. The edit is the ack."""
     from .flows import CLOSED, with_status
     message = interaction.message
-    await interaction.response.edit_message(content=with_status(message.content, CLOSED), view=None)
+    await edit_in_place(interaction, with_status(message.content, CLOSED))
 
 
 async def on_interaction(interaction):

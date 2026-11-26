@@ -49,6 +49,20 @@ hermes gateway restart
 
 The turn waits up to that long for an answer.
 
+### Optional: post to a server channel
+
+By default every card goes to your DM. To post them in a server channel instead, set its id (your Hermes home channel, for example) and restart the gateway if the change does not apply:
+
+```
+hermes config set plugins.entries.discord-approval.settings.channel 1575066493924933712
+```
+
+- The setting is read on every send. Empty (the default) means DM. Use digits only.
+- Approval cards, question cards, the closing line of a batch and long-turn pings all go there. The bot needs permission to view and send messages in that channel.
+- The card starts with an @mention of you, so your phone notifies. A batch mentions you on its first message only. The mention is the only ping allowed: `@everyone` and role mentions in a command never fire. A status edit keeps the mention and does not ping again.
+- If the channel can't be reached or the bot may not post there, one warning is logged and the card goes to your DM instead, so an approval is never lost. A batch stays in one place: after a failure the rest of it goes to the DM. If Discord accepted a channel post but the call timed out on our side, the DM fallback can post the same card twice; answer either one.
+- **Everyone who can see the channel sees the command text, session title, questions and reply excerpts.** Secrets are still redacted, but use a private channel. Only you can press the buttons.
+
 ## What you get
 
 - **Approvals.** With away on, a flagged command shows a DM card with Allow once, Allow for this session and Deny. There is no "always" button. An unanswered card is denied after the timeout. The card also warns you if a command was cut short or has hidden secrets or odd characters.

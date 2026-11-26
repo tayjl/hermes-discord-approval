@@ -80,12 +80,14 @@ class FakeCtx:
 class FakeResponse:
     def __init__(self):
         self.calls = []
+        self.allowed = []
 
     async def send_message(self, content, ephemeral=False):
         self.calls.append(("send_message", content, ephemeral))
 
-    async def edit_message(self, content, view="unset"):
+    async def edit_message(self, content, view="unset", allowed_mentions=None):
         self.calls.append(("edit_message", content, view))
+        self.allowed.append(allowed_mentions)
 
     async def send_modal(self, modal):
         self.calls.append(("send_modal", modal.custom_id, modal.title))
@@ -112,12 +114,13 @@ class FakeConnection:
         self.ensured = 0
         self.ready_ok = True
         self.sent = []  # (text, buttons) per DM
+        self.routes = []  # (channel, mention) per message
         self.selects = []  # the select menu of each DM that has one
         self.edits = []  # (message, text) per card edit
 
     def install(self, monkeypatch):
         """Replace the real send and thread helpers: run/submit run a coroutine to the end on the spot."""
-        for name in ("in_gateway", "ensure", "ready", "send_dm", "edit_card"):
+        for name in ("in_gateway", "ensure", "ready", "send", "edit_card"):
             monkeypatch.setattr(connection, name, getattr(self, name))
         monkeypatch.setattr(connection, "run", lambda value, timeout: _finish(value))
         monkeypatch.setattr(connection, "submit", _finish)
@@ -127,8 +130,9 @@ class FakeConnection:
         if not self.ready_ok:
             raise connection.PassThrough("discord not ready")
 
-    async def send_dm(self, text, buttons=(), select=None):
+    async def send(self, text, buttons=(), select=None, channel="", mention=False, route=None):
         self.sent.append((text, list(buttons)))
+        self.routes.append((channel, mention))
         if select:
             self.selects.append(select)
         return len(self.sent)  # stands in for the message

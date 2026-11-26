@@ -4,6 +4,7 @@ from . import connection, flows
 
 
 def register(ctx):
+    flows.use(ctx)
     ctx.register_command(
         "away", flows.make_command(ctx, "away", flows.AWAY_ON, flows.AWAY_OFF, flows.USAGE_AWAY),
         description="Send approvals and questions to Discord", args_hint="[on|off]",

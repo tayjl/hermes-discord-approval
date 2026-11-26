@@ -96,6 +96,7 @@ TITLE_CHARS = 100
 DESCRIPTION_CHARS = 200
 CARD_CHARS = 2000  # Discord's limit
 CARD_MARGIN = 20
+MENTION_CHARS = 24  # "<@", up to 20 digits, ">" and a newline: kept free on every card that may get a channel mention
 MAX_TITLES = 64
 QUESTION_CHARS = 1000
 CUSTOM_ID_CHARS = 100  # Discord's limit
@@ -228,6 +229,24 @@ def _plain(text):
     return re.sub(r"`(?=``)", "`\u200b", text)  # a zero-width space breaks every run of 3 backticks
 
 
+_ctx = None
+
+
+def use(ctx):
+    """Where the channel setting is read. Called by register(); without it every card goes to the DM."""
+    global _ctx
+    _ctx = ctx
+
+
+def _channel():
+    """The configured channel id, read per send, on the calling thread (config needs it). Empty means DM."""
+    value = str(_ctx.get_config("channel", "") or "").strip() if _ctx is not None else ""
+    if value and not value.isdigit():
+        logger.warning("discord-approval: the channel setting is not a channel id, sending DMs")
+        return ""
+    return value
+
+
 def _lookup_title(session_id):
     try:
         from gateway.session_context import get_session_env
@@ -300,7 +319,7 @@ def approval_card(command, description, title, window, edit=False):
         return "\n".join([text, *lines])
 
     # Room for the command: what is left after the rest of this card, the footer and the longest status line a later edit adds.
-    status = max(_units(line) for line in STATUS_LINES) + len("\n\n****")
+    status = max(_units(line) for line in STATUS_LINES) + len("\n\n****") + MENTION_CHARS
     room = CARD_CHARS - CARD_MARGIN - status - _units(framed(card("", warnings)))
     if _units(shown) > min(COMMAND_CHARS, room):
         warnings.insert(0, TOO_LONG)
@@ -379,7 +398,7 @@ async def on_approval_click(interaction, parts):
     else:
         entry.event.set()
     try:
-        await interaction.response.edit_message(content=with_status(interaction.message.content, line), view=None)
+        await connection.edit_in_place(interaction, with_status(interaction.message.content, line))
     except Exception as e:
         # The choice stands, so take the buttons off with a plain edit of the card.
         logger.warning("discord-approval: choice taken but the card edit failed (%s)", type(e).__name__)
@@ -417,7 +436,7 @@ def make_present(ctx):
         with _lock:
             _pending[request.request_id] = entry
         try:
-            entry.message = connection.run(connection.send_dm(entry.text, buttons), 10)
+            entry.message = connection.run(connection.send(entry.text, buttons, channel=_channel(), mention=True), 10)
             while not entry.event.wait(0.5):
                 if not ctx.get_config("away", False):
                     if _settle(entry, None, MOVED_TO_TERMINAL):
@@ -470,8 +489,8 @@ def _send_soon(coro):
         connection.submit(coro)
 
 
-async def _send_question(entry, buttons, select, status=None):
-    entry.message = await connection.send_dm(with_status(entry.text, status) if status else entry.text, buttons, select)
+async def _send_question(entry, buttons, select, status=None, channel="", mention=False, route=None):
+    entry.message = await connection.send(with_status(entry.text, status) if status else entry.text, buttons, select, channel=channel, mention=mention, route=route)
     if entry.done:  # settled while the card was still being sent
         await connection.edit_card(entry.message, with_status(entry.text, entry.line))
 
@@ -506,7 +525,7 @@ def _card(title, question, n=1, total=1):
         return framed(text) if total == 1 else text
 
     # Clip to the room left in UTF-16 units, with the longest status line a later edit adds, as approval_card does.
-    status = max(_units(line) for line in STATUS_LINES) + len("\n\n****")
+    status = max(_units(line) for line in STATUS_LINES) + len("\n\n****") + (MENTION_CHARS if n == 1 else 0)
     room = CARD_CHARS - CARD_MARGIN - status - _units(build(""))
     cut = _redact(question).encode("utf-16-le")[:2 * max(0, min(QUESTION_CHARS, room))]
     return build(cut.decode("utf-16-le", "ignore"))  # 'ignore' drops a split surrogate pair
@@ -540,7 +559,7 @@ def _send_cards(keys, cards, srq=None, batch=None):
         _questions.update(zip(keys, (card[0] for card in cards)))
     try:
         connection.ready(READY_WAIT_S)  # the first use after a restart starts the connection and waits for it
-        connection.submit(_send_batch(cards))
+        connection.submit(_send_batch(cards, _channel()))
     except Exception:
         with _lock:
             _batches.pop(srq, None)
@@ -549,12 +568,13 @@ def _send_cards(keys, cards, srq=None, batch=None):
         raise
 
 
-async def _send_batch(cards):
+async def _send_batch(cards, channel=""):
+    route = {}  # one destination for the whole batch
     try:
-        for card in cards:  # one at a time, so the messages land in order
-            await _send_question(*card)
+        for n, card in enumerate(cards):  # one at a time, so the messages land in order
+            await _send_question(*card, channel=channel, mention=n == 0, route=route)  # only the first message pings
         if len(cards) > 1:
-            await connection.send_dm(FOOTER)
+            await connection.send(FOOTER, channel=channel, route=route)
     except Exception as e:
         # The cards already sent stay registered, so the settled hook still closes them. A card that never went out has
         # nothing to close, and sending is fire and forget, so only here can its key be dropped.
@@ -671,7 +691,7 @@ async def _answer(interaction, prompt_id, answer):
         line = _lock_batch(entry, batch, answer)
     else:
         line = ANSWERED.format(answer=answer[:ANSWER_CHARS]) if clarify_gateway.resolve_gateway_clarify(prompt_id, answer) else CLOSED
-    await interaction.response.edit_message(content=with_status(interaction.message.content, line), view=None)
+    await connection.edit_in_place(interaction, with_status(interaction.message.content, line))
 
 
 def _lock_batch(entry, batch, answer):
@@ -859,7 +879,7 @@ def make_ping_hooks(ctx):
         text = PING.format(outcome=OUTCOME[outcome], duration=_duration(seconds), title=_lookup_title(started[1]))
         excerpt = _excerpt(reply)
         try:
-            _send_soon(connection.send_dm(framed(f"{text}\n{excerpt}" if excerpt else text)))
+            _send_soon(connection.send(framed(f"{text}\n{excerpt}" if excerpt else text), channel=_channel(), mention=True))
         except PassThrough as e:
             logger.warning("discord-approval: ping not sent (%s)", e)
 
