@@ -7,7 +7,7 @@ A Hermes plugin that sends approval prompts and agent questions to your Discord 
 - **Approvals.** With away on, a flagged command shows up as a DM card with Allow once, Allow for this session and Deny buttons. There is no "always" button. If you don't answer in time, the card says so and the command is denied. A command too long to show in full can only be denied.
 - **Questions.** With away on, the agent's clarify questions also show up as a DM. Tap a choice, pick from a menu, or tap Answer and type your own.
 - **Long-turn pings.** With ping on, a turn that takes 3 minutes or more sends you a DM with the outcome, how long it took and the first lines of the reply.
-- **Commands.** `/away [on|off]` and `/ping [on|off]` work in the terminal, the dashboard and from your own Discord DM. With no argument they toggle.
+- **Commands.** `/away [on|off]` and `/ping [on|off]` work in the terminal, the dashboard and from your own Discord DM. With no argument they toggle. Turning away on also turns pings on. Each reply is a small panel showing away-mode and ping-mode, then what changed.
 
 It only works inside the gateway process. Anywhere else it does nothing and the normal prompt shows.
 

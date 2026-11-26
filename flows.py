@@ -28,6 +28,7 @@ AWAY_ON = "Away is on. Approvals and questions go to your Discord DMs."
 AWAY_OFF = "Away is off. Prompts go back to the terminal."
 PING_ON = "Long-turn pings are on. Turns of 3 minutes or more send you a DM."
 PING_OFF = "Long-turn pings are off."
+PING_ALSO_ON = "Pings are on too."  # short enough to keep the terminal reply under 400 characters
 USAGE_AWAY = "Use /away, /away on or /away off."
 USAGE_PING = "Use /ping, /ping on or /ping off."
 NOT_ALLOWED = "Only the owner can use this."
@@ -36,9 +37,17 @@ SAVE_FAILED = "Could not save the setting."
 # Same look as the daily digest. Escape codes count toward Discord's 2000 characters.
 _YELLOW, _RESET, _REVERSED = "\x1b[1;38;2;255;216;0m", "\x1b[0m", "\x1b[7;37m"
 _RULE = "\u2500"
-HEADER = (f"```ansi\n{_YELLOW}\u256d{_RULE * 36}\u256e\n"
-          f"{_REVERSED}{'-' * 7}{_RESET}{_YELLOW}HERMES DISCORD APPROVAL{_REVERSED}{'-' * 8}{_RESET}{_YELLOW}\n"
-          f"\u2570{_RULE * 36}\u256f{_RESET}\n```")
+_GREY = "\x1b[38;5;245m"
+
+
+def _header(title):
+    return (f"```ansi\n{_YELLOW}\u256d{_RULE * 36}\u256e\n"
+            f"{_REVERSED}{'-' * 7}{_RESET}{_YELLOW}{title}{_REVERSED}{'-' * (31 - len(title))}{_RESET}{_YELLOW}\n"
+            f"\u2570{_RULE * 36}\u256f{_RESET}\n```")
+
+
+HEADER = _header("HERMES DISCORD APPROVAL")
+RESPONSE_HEADER = _header("HERMES DISCORD RESPONSE")
 FOOTER = f"```ansi\n{_YELLOW}\u2570{_RULE * 36}\u256f{_RESET}\n```"
 CODE_BOX = f"```ansi\n{_YELLOW}\u250c{_RULE * 37}{_RESET}\n{{code}}\n{_YELLOW}\u2514{_RULE * 37}{_RESET}\n```"
 
@@ -98,24 +107,46 @@ def _allowed(source, platform):
     return platform in LOCAL_PLATFORMS
 
 
+def _state(label, on):
+    value = f"{_YELLOW}on{_RESET}" if on else f"{_GREY}off{_RESET}"
+    return f"{label} : {value}"
+
+
+def _status_panel(ctx, platform, change=None):
+    lines = "\n".join((_state("away-mode", ctx.get_config("away", False)),
+                       _state("ping-mode", ctx.get_config("ping", False))))
+    tail = f"\n{change}" if change else ""
+    text = f"{RESPONSE_HEADER}\n{CODE_BOX.format(code=lines)}{tail}"
+    if platform in LOCAL_PLATFORMS:
+        # No fences, and the TUI collapses system messages over 400 characters, so let yellow carry
+        # across lines and reverse-off (27) instead of reset-and-yellow again. Away on is still
+        # 6 over, hence the short ping note.
+        return (text.replace("```ansi\n", "").replace("\n```", "")
+                .replace(f"{_RESET}{_YELLOW}", "\x1b[27m")
+                .replace(f"{_RESET}\n{_YELLOW}\u250c", "\n\u250c")
+                .replace(f"on{_RESET}\n{_YELLOW}\u2514", "on\n\u2514")
+                .replace(f"{_RESET}\n{_YELLOW}\u2514", f"\n{_YELLOW}\u2514"))
+    return text
+
+
 def make_command(ctx, key, on_text, off_text, usage):
     def handler(raw_args, source=None, platform=None):
         if not _allowed(source, platform):
             return NOT_ALLOWED
         arg = (raw_args or "").strip().lower()
-        if arg == "":
-            value = not ctx.get_config(key, False)
-        elif arg in ("on", "off"):
-            value = arg == "on"
-        else:
+        if arg not in ("", "on", "off"):
             return usage
+        value = not ctx.get_config(key, False) if arg == "" else arg == "on"
         try:
             ctx.set_config(key, value)
+            if key == "away" and value:
+                ctx.set_config("ping", True)
         except PermissionError:
             return SAVE_FAILED
         if value:
             connection.ensure()
-        return on_text if value else off_text
+        change = on_text if value else off_text
+        return _status_panel(ctx, platform, f"{change} {PING_ALSO_ON}" if key == "away" and value else change)
     return handler
 
 
