@@ -15,6 +15,8 @@ PREFIX = "hda:"
 
 _lock = threading.Lock()
 _conn = None
+_token = None  # set by capture_token(), never logged
+_user_ids = None  # raw DISCORD_ALLOWED_USERS, set by capture_token()
 _gateway = False  # cached once True: the lock may be claimed after the plugin loads
 _gateway_logged = None
 _warned_user = False
@@ -46,7 +48,8 @@ def in_gateway():
 def user_id():
     """The single allowed Discord user id as a string, or None (one warning) if not exactly one."""
     global _warned_user
-    ids = [i.strip() for i in (get_secret("DISCORD_ALLOWED_USERS") or "").split(",") if i.strip()]
+    raw = _user_ids if _user_ids is not None else get_secret("DISCORD_ALLOWED_USERS")  # worker threads have no secret scope
+    ids = [i.strip() for i in (raw or "").split(",") if i.strip()]
     if len(ids) == 1 and ids[0].isdigit():
         return ids[0]
     if not _warned_user:
@@ -56,19 +59,26 @@ def user_id():
 
 
 class Connection:
-    def __init__(self):
+    def __init__(self, token):
+        self._token = token  # read by the caller: this thread has no secret scope
         self.loop = None
         self.client = None
         self.ready_event = threading.Event()
         self.delay = BACKOFF_START_S
         self._stopping = False
         self._task = None
-        self._thread = threading.Thread(target=lambda: asyncio.run(self._main()), name="hda-discord", daemon=True)
+        self._thread = threading.Thread(target=self._run, name="hda-discord", daemon=True)
+
+    def _run(self):
+        try:
+            asyncio.run(self._main())
+        except Exception as e:
+            logger.warning("discord-approval: connection thread crashed (%s)", type(e).__name__)
 
     async def _main(self):
         self.loop = asyncio.get_running_loop()
         self._task = asyncio.current_task()
-        token = get_secret("DISCORD_BOT_TOKEN")
+        token = self._token
         try:
             while not self._stopping:
                 client = self.client = discord.Client(intents=discord.Intents.none())
@@ -120,18 +130,29 @@ class Connection:
         return self.submit(coro).result(timeout)
 
 
+def capture_token():
+    """Read the token and user id once where a secret scope exists (register), for threads that have none."""
+    global _token, _user_ids
+    try:
+        _token = get_secret("DISCORD_BOT_TOKEN") or _token
+        _user_ids = get_secret("DISCORD_ALLOWED_USERS") or _user_ids
+    except Exception as e:
+        logger.warning("discord-approval: could not read the secrets at load (%s)", type(e).__name__)
+
+
 def get():
     global _conn
     with _lock:
-        if _conn is None:
-            _conn = Connection()
+        if _conn is None or not _conn._thread.is_alive():  # a crashed thread is replaced
+            _conn = Connection(_token or get_secret("DISCORD_BOT_TOKEN"))
             _conn._thread.start()
+            logger.info("discord-approval: connection thread started")
         return _conn
 
 
 def ensure():
     """Start the connection early. Does nothing outside the gateway or without a valid config."""
-    if in_gateway() and user_id() and get_secret("DISCORD_BOT_TOKEN"):
+    if in_gateway() and user_id() and (_token or get_secret("DISCORD_BOT_TOKEN")):
         get()
 
 

@@ -4,7 +4,7 @@ import threading
 import time
 
 import discord
-from fakes import OWNER, FakeConnection, secrets
+from fakes import OWNER, FakeConnection, FakeCtx, secrets
 from hda import connection, flows
 
 
@@ -90,7 +90,7 @@ def test_backoff_doubles_to_the_cap_and_resets_after_ready(monkeypatch):
 
     _patch_client(monkeypatch, script)
     sleeps = []
-    conn = connection.Connection()
+    conn = connection.Connection("fake-token")
 
     async def fake_sleep(seconds):
         sleeps.append(seconds)
@@ -204,3 +204,195 @@ def test_submit_logs_a_failed_background_send(monkeypatch):
     finally:
         connection.logger.removeHandler(handler)
     assert len(records) == 1 and "ValueError" in records[0].getMessage() and "private" not in records[0].getMessage()
+
+
+def test_thread_gets_the_token_from_the_caller_and_never_reads_secrets(monkeypatch):
+    caller = threading.current_thread()
+    tokens = []
+
+    def scoped_secret(name, default=None):
+        if threading.current_thread() is not caller:  # stands in for UnscopedSecretError
+            raise RuntimeError("unscoped")
+        return "tok"
+
+    async def script(client, call):
+        await asyncio.Event().wait()
+
+    class TokenClient(FakeClient):
+        async def start(self, token, reconnect=True):
+            tokens.append(token)
+            await super().start(token, reconnect)
+
+    _patch_client(monkeypatch, script)
+    monkeypatch.setattr(connection, "get_secret", scoped_secret)
+    monkeypatch.setattr(discord, "Client", TokenClient)
+    try:
+        connection.get()
+        _wait_for(lambda: tokens)
+    finally:
+        connection.stop()
+    assert tokens == ["tok"]
+
+
+def test_dead_thread_is_logged_and_replaced_on_next_get(monkeypatch):
+    secrets(monkeypatch)
+    _patch_client(monkeypatch)
+
+    def broken(intents=None):
+        raise ValueError("secret detail")
+
+    monkeypatch.setattr(discord, "Client", broken)
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    connection.logger.addHandler(handler)
+    try:
+        first = connection.get()
+        first._thread.join(3)
+        assert not first._thread.is_alive()
+        assert len(records) == 1 and "ValueError" in records[0].getMessage() and "secret" not in records[0].getMessage()
+        monkeypatch.setattr(discord, "Client", FakeClient)
+        second = connection.get()
+        assert second is not first
+        assert connection.get() is second  # a live one is kept
+        _wait_for(lambda: FakeClient.instances)
+    finally:
+        connection.logger.removeHandler(handler)
+        connection.stop()
+
+
+def test_hook_failures_are_logged_with_the_type_only():
+    @flows._logged
+    def hook(**_):
+        raise KeyError("private detail")
+
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    flows.logger.addHandler(handler)
+    try:
+        assert hook(a=1) is None
+    finally:
+        flows.logger.removeHandler(handler)
+    assert len(records) == 1 and records[0].levelno == logging.WARNING
+    assert "KeyError" in records[0].getMessage() and "private" not in records[0].getMessage()
+
+
+def test_first_clarify_after_a_restart_waits_for_the_connection_and_sends(monkeypatch):
+    from tools import clarify_gateway
+    sent = []
+
+    class Client(FakeClient):
+        async def fetch_user(self, user_id):
+            async def send(text, view=None):
+                sent.append((user_id, text))
+            return type("User", (), {"send": staticmethod(send)})
+
+    async def script(client, call):
+        await asyncio.sleep(0.2)  # the connection is not up when the hook fires
+        await client.handlers["on_ready"]()
+        await asyncio.Event().wait()
+
+    secrets(monkeypatch)
+    _patch_client(monkeypatch, script)
+    monkeypatch.setattr(discord, "Client", Client)
+    monkeypatch.setattr(connection, "_gateway", True)
+    monkeypatch.setattr(flows, "_questions", {})
+    monkeypatch.setattr(flows, "_lookup_title", lambda session_id: "T")
+    clarify_gateway.register("pw", "session-a", "Q?", ["x"], authority={})
+    try:
+        assert connection._conn is None
+        flows._open_question("s1", "pw")
+        _wait_for(lambda: sent)
+    finally:
+        clarify_gateway._entries.pop("pw", None)
+        connection.stop()
+    assert sent[0][0] == int(OWNER) and "Q?" in sent[0][1]
+
+
+def test_warm_start_runs_once_when_the_gateway_lock_is_first_seen(monkeypatch):
+    secrets(monkeypatch)
+    fake = FakeConnection(gateway=False).install(monkeypatch)
+    monkeypatch.setattr(flows, "_warmed", False)
+    pre_turn = flows.make_ping_hooks(FakeCtx({"away": True}))[0]
+    pre_turn(session_id="s", turn_id="t1")
+    assert fake.ensured == 0  # not the gateway yet
+    fake.gateway = True
+    pre_turn(session_id="s", turn_id="t2")
+    pre_turn(session_id="s", turn_id="t3")
+    assert fake.ensured == 1
+
+
+def test_warm_start_skips_when_away_and_ping_are_off(monkeypatch):
+    secrets(monkeypatch)
+    fake = FakeConnection().install(monkeypatch)
+    monkeypatch.setattr(flows, "_warmed", False)
+    flows.make_ping_hooks(FakeCtx())[0](session_id="s", turn_id="t")
+    assert fake.ensured == 0
+
+
+def test_token_captured_at_register_is_used_from_an_unscoped_thread(monkeypatch):
+    tokens = []
+
+    async def script(client, call):
+        await asyncio.Event().wait()
+
+    class TokenClient(FakeClient):
+        async def start(self, token, reconnect=True):
+            tokens.append(token)
+            await super().start(token, reconnect)
+
+    _patch_client(monkeypatch, script)
+    monkeypatch.setattr(discord, "Client", TokenClient)
+    monkeypatch.setattr(connection, "_token", None)
+    monkeypatch.setattr(connection, "get_secret", lambda name, default=None: "captured")
+    connection.capture_token()
+
+    def unscoped(name, default=None):
+        raise RuntimeError("unscoped")
+
+    monkeypatch.setattr(connection, "get_secret", unscoped)
+    worker = threading.Thread(target=connection.get)
+    try:
+        worker.start()
+        worker.join(3)
+        _wait_for(lambda: tokens)
+    finally:
+        connection.stop()
+    assert tokens == ["captured"]
+
+
+def test_swallowed_prompt_failures_and_a_missing_entry_are_logged(monkeypatch):
+    secrets(monkeypatch)
+    fake = FakeConnection().install(monkeypatch)
+    fake.ready_ok = False
+    monkeypatch.setattr(flows, "_questions", {})
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    flows.logger.addHandler(handler)
+    try:
+        on_prompt = flows.make_prompt_hooks(FakeCtx({"away": True}))[0]
+        on_prompt(session_id="s", kind="clarify", prompt_id="srq-none")
+        on_prompt(session_id="s", kind="approval", prompt_id="x")
+    finally:
+        flows.logger.removeHandler(handler)
+    messages = [r.getMessage() for r in records if r.levelno == logging.WARNING]
+    assert any("no pending clarify entry" in m for m in messages)
+    assert any("approval prompt not sent" in m and "not ready" in m for m in messages)
+
+
+def test_user_id_captured_at_register_is_read_without_a_secret_scope(monkeypatch):
+    monkeypatch.setattr(connection, "_user_ids", None)
+    monkeypatch.setattr(connection, "get_secret", lambda name, default=None: OWNER)
+    connection.capture_token()
+
+    def unscoped(name, default=None):
+        raise RuntimeError("unscoped")
+
+    monkeypatch.setattr(connection, "get_secret", unscoped)
+    found = []
+    worker = threading.Thread(target=lambda: found.append(connection.user_id()))
+    worker.start()
+    worker.join(3)
+    assert found == [OWNER]

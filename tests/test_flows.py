@@ -1,3 +1,4 @@
+import logging
 import threading
 import time
 
@@ -392,3 +393,21 @@ def test_spike_transport_config_is_read_per_request(monkeypatch, tmp_path):
     time.sleep(0.05)
     cfg.write_text(yaml.safe_dump({"security": {"approval": {"transport": "builtin"}}}))
     assert approval_context._get_approval_transport_config()[0] == "builtin"
+
+
+def test_present_failure_is_logged_by_type_only_and_reraised(monkeypatch):
+    _, _, present = _setup(monkeypatch)
+    monkeypatch.setattr(connection, "ready", lambda timeout: (_ for _ in ()).throw(ValueError("secret-token")))
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    flows.logger.addHandler(handler)
+    try:
+        present(_req())
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+    finally:
+        flows.logger.removeHandler(handler)
+    warnings = [r.getMessage() for r in records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "ValueError" in warnings[0] and "secret-token" not in warnings[0]

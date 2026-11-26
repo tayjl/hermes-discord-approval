@@ -1,5 +1,6 @@
 """Strings and the /away and /ping command handlers."""
 
+import functools
 import json
 import logging
 import re
@@ -11,6 +12,17 @@ from . import connection
 from .connection import PassThrough
 
 logger = logging.getLogger(__name__)
+
+
+def _logged(hook):
+    """Hermes logs a failing hook at DEBUG only: make it visible. Type only, never the message."""
+    @functools.wraps(hook)
+    def wrapper(*args, **kwargs):
+        try:
+            return hook(*args, **kwargs)
+        except Exception as e:
+            logger.warning("discord-approval: %s failed (%s)", hook.__name__, type(e).__name__)
+    return wrapper
 
 AWAY_ON = "Away is on. Approvals and questions go to your Discord DMs."
 AWAY_OFF = "Away is off. Prompts go back to the terminal."
@@ -34,7 +46,7 @@ MOVED_TO_TERMINAL = "Away is off. This one moved to the terminal."
 CLOSED = "This request is no longer open."
 NOT_YOURS = "This is not for you."
 UNTITLED = "Untitled session"
-SUBAGENT_WAITING = "A subagent in {title} needs approval in the terminal."
+SUBAGENT_WAITING = "{title} needs approval in the terminal."
 
 QUESTION_CARD = "**Question**\nSession: {title}\n{question}"
 ANSWER_BUTTON = "Answer"
@@ -131,6 +143,7 @@ def _lookup_title(session_id):
 
 
 def make_pre_approval_request(ctx):
+    @_logged
     def pre_approval_request(request_id=None, session_id=None, surface=None, **_):
         # present() runs on a worker thread with no session context, so the title is read here.
         if surface != SURFACE or not ctx.get_config("away", False):
@@ -143,6 +156,7 @@ def make_pre_approval_request(ctx):
     return pre_approval_request
 
 
+@_logged
 def post_approval_response(request_id=None, surface=None, **_):
     # Still open here means the host gave up first (interrupted, busy or timed out).
     if surface != SURFACE:
@@ -210,6 +224,17 @@ connection.ROUTES["a"] = on_approval_click
 
 def make_present(ctx):
     def present(request):
+        # Hermes reports any exception as a bare "error", so say what it was. Type only, never the message.
+        try:
+            return _present(request)
+        except PassThrough as e:
+            logger.info("discord-approval: present passed through (%s)", e)  # our own fixed text
+            raise
+        except Exception as e:
+            logger.warning("discord-approval: present failed (%s)", type(e).__name__)
+            raise
+
+    def _present(request):
         start = monotonic()  # the host's clock started about now, so every deadline counts from here
         if not ctx.get_config("away", False) or not connection.in_gateway() or not connection.user_id():
             raise PassThrough("away is off")
@@ -249,6 +274,36 @@ def _on():
     return connection.in_gateway() and connection.user_id()
 
 
+_warmed = False
+
+
+def _warm(ctx):
+    """The gateway lock is claimed after the plugin loads, so start the connection at the first hook that sees it."""
+    global _warmed
+    if _warmed or not connection.in_gateway():
+        return
+    _warmed = True
+    if ctx.get_config("away", False) or ctx.get_config("ping", False):
+        connection.ensure()
+
+
+def _send_soon(coro):
+    """For hooks on the agent's own thread: never block it. Send now when connected, else once the connection is up."""
+    try:
+        connection.ready(0)
+    except PassThrough:
+        def wait_then_send():
+            try:
+                connection.ready(READY_WAIT_S)
+                connection.submit(coro)
+            except PassThrough as e:
+                coro.close()
+                logger.warning("discord-approval: message not sent (%s)", e)
+        threading.Thread(target=wait_then_send, name="hda-send", daemon=True).start()
+    else:
+        connection.submit(coro)
+
+
 async def _send_question(entry, buttons, select):
     entry.message = await connection.send_dm(entry.text, buttons, select)
     if entry.done:  # settled while the card was still being sent
@@ -259,6 +314,7 @@ def _open_question(session_id, prompt_id):
     from tools import clarify_gateway
     pending = clarify_gateway.get_pending(prompt_id)
     if pending is None:
+        logger.warning("discord-approval: no pending clarify entry for prompt %s, not sent", str(prompt_id)[:12])
         return
     question = _redact(pending.question)[:QUESTION_CHARS]
     labels = [_redact(c)[:LABEL_CHARS] for c in pending.choices or []]
@@ -277,6 +333,7 @@ def _open_question(session_id, prompt_id):
     with _lock:
         _questions[prompt_id] = entry
     try:
+        connection.ready(READY_WAIT_S)  # the first use after a restart starts the connection and waits for it
         connection.submit(_send_question(entry, buttons, select))
     except Exception:
         with _lock:
@@ -352,7 +409,9 @@ connection.ROUTES["cm"] = on_clarify_modal
 
 
 def make_prompt_hooks(ctx):
+    @_logged
     def on_session_prompt(session_id=None, kind=None, prompt_id=None, **_):
+        _warm(ctx)
         if kind not in ("approval", "clarify") or not ctx.get_config("away", False) or not _on():
             return
         try:
@@ -360,10 +419,13 @@ def make_prompt_hooks(ctx):
                 _open_question(session_id, prompt_id)
             else:
                 # Profile-routed subagents use the builtin queue, so all we can do is say one is waiting.
+                # This runs on the hook worker thread, so waiting for the connection is safe.
+                connection.ready(READY_WAIT_S)
                 connection.submit(connection.send_dm(SUBAGENT_WAITING.format(title=_lookup_title(session_id))))
-        except PassThrough:
-            pass
+        except PassThrough as e:
+            logger.warning("discord-approval: %s prompt not sent (%s)", kind, e)
 
+    @_logged
     def on_session_prompt_settled(prompt_id=None, **_):
         with _lock:
             entry = _questions.pop(prompt_id, None)
@@ -388,7 +450,9 @@ def _excerpt(reply):
 
 
 def make_ping_hooks(ctx):
+    @_logged
     def pre_llm_call(session_id=None, turn_id=None, parent_session_id=None, **_):
+        _warm(ctx)
         now = monotonic()
         with _lock:
             for table in (_starts, _replies):
@@ -397,11 +461,13 @@ def make_ping_hooks(ctx):
             if turn_id and not parent_session_id:
                 _starts[turn_id] = (now, session_id)
 
+    @_logged
     def post_llm_call(turn_id=None, assistant_response=None, **_):
         with _lock:
             if turn_id in _starts:
                 _replies[turn_id] = (monotonic(), str(assistant_response or ""))
 
+    @_logged
     def on_session_end(turn_id=None, completed=None, failed=None, interrupted=None, **_):
         with _lock:
             started = _starts.pop(turn_id, None)
@@ -415,8 +481,8 @@ def make_ping_hooks(ctx):
         text = PING.format(outcome=OUTCOME[outcome], duration=_duration(seconds), title=_lookup_title(started[1]))
         excerpt = _excerpt(reply)
         try:
-            connection.submit(connection.send_dm(f"{text}\n{excerpt}" if excerpt else text))
-        except PassThrough:
-            pass
+            _send_soon(connection.send_dm(f"{text}\n{excerpt}" if excerpt else text))
+        except PassThrough as e:
+            logger.warning("discord-approval: ping not sent (%s)", e)
 
     return pre_llm_call, post_llm_call, on_session_end

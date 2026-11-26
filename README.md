@@ -40,7 +40,7 @@ Keep `transport_fallback` set to `builtin`. Without it, an approval the plugin c
 
 ## Known gaps
 
-- Approvals from profile-routed subagents (for example the orchestrator delegating to devops) don't get buttons. You get a DM saying a subagent needs approval in the terminal.
+- Approvals from profile-routed subagents (for example the orchestrator delegating to devops) don't get buttons. You get a DM saying the session needs approval in the terminal.
 - Questions in a Discord session are not sent here. The gateway already shows them in the channel.
 - Not covered: the action gate, MCP elicitation, and sudo and secret prompts.
 - While away is off, every approval logs two warning lines. This is expected.
@@ -64,7 +64,7 @@ Start in a classic CLI session on the gateway, with the DM with the bot open on 
 - **L4:** Repeat L2 and don't tap. Before the approval window ends, the card says "No answer in time. Denied."
 - **L5:** Repeat L2. While the card waits, type `/away off` in the CLI. Within about 1 second the card says "Away is off. This one moved to the terminal." and the normal CLI prompt appears. Answer it there.
 - **L6:** With away on, ask "ask me which colour I prefer, red or blue, using clarify". The DM shows Red, Blue and Answer buttons. Tap Blue and the agent continues with blue. Repeat and tap **Answer**, type "green" in the box, and the agent gets "green". Repeat and answer in the CLI instead, and the card says "This request is no longer open."
-- **L7 (subagent, the push case):** With away on, have the orchestrator delegate a flagged command to the devops profile. Expected: the CLI shows the normal approval card and the DM says "A subagent in <title> needs approval in the terminal." with no buttons. Note what actually happens. If the DM card has buttons instead, the plain child path was taken, so tap Allow once.
+- **L7 (subagent, the push case):** With away on, have the orchestrator delegate a flagged command to the devops profile. Expected: the CLI shows the normal approval card and the DM says "<title> needs approval in the terminal." with no buttons. Note what actually happens. If the DM card has buttons instead, the plain child path was taken, so tap Allow once.
 - **L8:** Type `/ping on`, then ask for something that takes 3 minutes or more, for example "wait 200 seconds using the terminal, then say done". A DM arrives saying "**Done** after 3 min: <title>" with the first lines of the reply. A short turn sends nothing. Interrupt a long turn and the DM says "Stopped".
 - **L9 (restart):** Leave an approval card open, run `hermes gateway restart`, then tap the old card. It loses its buttons and says "This request is no longer open." Discord may show "This interaction failed" for a click made before the plugin reconnects, which takes about 3 seconds after the gateway is up.
 - **L10:** Type `/away off`, trigger L2 again, and the normal CLI prompt shows with no DM. Two warning lines in the log are expected.

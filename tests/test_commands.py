@@ -4,6 +4,7 @@ from hda import connection, flows, register
 
 def _setup(monkeypatch, config=None):
     secrets(monkeypatch)
+    monkeypatch.setattr(connection, "_token", None)  # register() captures the token
     fake = FakeConnection()
     monkeypatch.setattr(connection, "ensure", fake.ensure)
     ctx = FakeCtx(config)
@@ -85,6 +86,7 @@ def test_other_platform_is_refused(monkeypatch):
 
 def test_invalid_owner_config_refuses_discord(monkeypatch):
     secrets(monkeypatch, user="1,2")
+    monkeypatch.setattr(connection, "_token", None)
     ctx = FakeCtx()
     register(ctx)
     anyone = type("S", (), {"user_id": "1"})()

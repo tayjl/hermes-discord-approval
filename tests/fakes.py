@@ -41,6 +41,7 @@ def _request():
 
 def secrets(monkeypatch, user=OWNER, token="fake-token"):
     # Any name other than the user list is the bot token.
+    monkeypatch.setattr(connection, "_user_ids", None)  # a captured value from an earlier register() would hide the patched secret
     monkeypatch.setattr(connection, "get_secret", lambda name, default=None: user if name == "DISCORD_ALLOWED_USERS" else token)
 
 

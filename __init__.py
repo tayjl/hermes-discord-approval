@@ -23,5 +23,6 @@ def register(ctx):
     ctx.register_hook("post_llm_call", post_turn)
     ctx.register_hook("on_session_end", turn_end)
     ctx.on_unload(connection.stop)
+    connection.capture_token()
     if ctx.get_config("away", False) or ctx.get_config("ping", False):
         connection.ensure()
