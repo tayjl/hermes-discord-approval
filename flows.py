@@ -28,7 +28,7 @@ AWAY_ON = "Away is on. Approvals and questions go to your Discord DMs."
 AWAY_OFF = "Away is off. Prompts go back to the terminal."
 PING_ON = "Long-turn pings are on. Turns of 3 minutes or more send you a DM."
 PING_OFF = "Long-turn pings are off."
-PING_ALSO_ON = "Pings are on too."  # short enough to keep the terminal reply under 400 characters
+PING_ALSO_ON = "Pings are on too."
 USAGE_AWAY = "Use /away, /away on or /away off."
 USAGE_PING = "Use /ping, /ping on or /ping off."
 NOT_ALLOWED = "Only the owner can use this."
@@ -112,21 +112,43 @@ def _state(label, on):
     return f"{label} : {value}"
 
 
+def _local_panel(ctx):
+    """Same rounded rich panel as the claude-swap plugin, with the skin's colours."""
+    import io
+    import shutil
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.text import Text
+    try:
+        from hermes_cli.skin_engine import get_active_skin
+        skin = get_active_skin()
+        accent, border, head = (skin.get_color("ui_accent", "#FFBF00"), skin.get_color("banner_border", "#CD7F32"),
+                                skin.get_color("banner_title", "#FFD700"))
+    except Exception:
+        accent, border, head = "#FFBF00", "#CD7F32", "#FFD700"
+    body = Text()
+    for n, (label, key) in enumerate((("away-mode", "away"), ("ping-mode", "ping"))):
+        on = ctx.get_config(key, False)
+        body.append(("\n" if n else "") + f"{label} : ")
+        body.append("on" if on else "off", style=f"bold {accent}" if on else "dim")
+    buf = io.StringIO()
+    # legacy_windows=False: otherwise rich swaps the rounded corners for square ones
+    console = Console(file=buf, force_terminal=True, color_system="truecolor",
+                      width=shutil.get_terminal_size().columns, legacy_windows=False)
+    console.print(Panel(body, title=Text("HERMES DISCORD RESPONSE", style=f"bold {head}"), border_style=border,
+                        padding=(0, 2), expand=False))
+    # A reset before the bold title is redundant (the border style has no attributes to clear). Resets after
+    # it stay, or the bold would leak into the border. The TUI collapses replies over 400 characters.
+    return re.sub(r"\x1b\[0m(?=\x1b\[1;)", "", buf.getvalue().rstrip("\n"))
+
+
 def _status_panel(ctx, platform, change=None):
+    tail = f"\n{change}" if change else ""
+    if platform in LOCAL_PLATFORMS:
+        return f"{_local_panel(ctx)}{tail}"
     lines = "\n".join((_state("away-mode", ctx.get_config("away", False)),
                        _state("ping-mode", ctx.get_config("ping", False))))
-    tail = f"\n{change}" if change else ""
-    text = f"{RESPONSE_HEADER}\n{CODE_BOX.format(code=lines)}{tail}"
-    if platform in LOCAL_PLATFORMS:
-        # No fences, and the TUI collapses system messages over 400 characters, so let yellow carry
-        # across lines and reverse-off (27) instead of reset-and-yellow again. Away on is still
-        # 6 over, hence the short ping note.
-        return (text.replace("```ansi\n", "").replace("\n```", "")
-                .replace(f"{_RESET}{_YELLOW}", "\x1b[27m")
-                .replace(f"{_RESET}\n{_YELLOW}\u250c", "\n\u250c")
-                .replace(f"on{_RESET}\n{_YELLOW}\u2514", "on\n\u2514")
-                .replace(f"{_RESET}\n{_YELLOW}\u2514", f"\n{_YELLOW}\u2514"))
-    return text
+    return f"{RESPONSE_HEADER}\n{CODE_BOX.format(code=lines)}{tail}"
 
 
 def make_command(ctx, key, on_text, off_text, usage):
@@ -146,7 +168,9 @@ def make_command(ctx, key, on_text, off_text, usage):
         if value:
             connection.ensure()
         change = on_text if value else off_text
-        return _status_panel(ctx, platform, f"{change} {PING_ALSO_ON}" if key == "away" and value else change)
+        # The local panel already shows ping-mode, and the note would push the reply past the TUI's 400 characters.
+        also = key == "away" and value and platform not in LOCAL_PLATFORMS
+        return _status_panel(ctx, platform, f"{change} {PING_ALSO_ON}" if also else change)
     return handler
 
 
