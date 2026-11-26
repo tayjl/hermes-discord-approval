@@ -373,7 +373,7 @@ def test_swallowed_prompt_failures_and_a_missing_entry_are_logged(monkeypatch):
     flows.logger.addHandler(handler)
     try:
         on_prompt = flows.make_prompt_hooks(FakeCtx({"away": True}))[0]
-        on_prompt(session_id="s", kind="clarify", prompt_id="srq-none")
+        on_prompt(session_id="s", kind="clarify", prompt_id="none")
         on_prompt(session_id="s", kind="approval", prompt_id="x")
     finally:
         flows.logger.removeHandler(handler)

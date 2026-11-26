@@ -5,7 +5,7 @@ A Hermes plugin that sends approval prompts and agent questions to your Discord 
 ## What it does
 
 - **Approvals.** With away on, a flagged command shows up as a DM card with Allow once, Allow for this session and Deny buttons. There is no "always" button. If you don't answer in time, the card says so and the command is denied. A command too long to show in full can only be denied.
-- **Questions.** With away on, the agent's clarify questions also show up as a DM. Tap a choice, pick from a menu, or tap Answer and type your own.
+- **Questions.** With away on, the agent's clarify questions also show up as a DM. Tap a choice, pick from a menu, or tap Answer and type your own. Questions asked from the TUI, CLI or Desktop work too, and the terminal answer wins.
 - **Long-turn pings.** With ping on, a turn that takes 3 minutes or more sends you a DM with the outcome, how long it took and the first lines of the reply.
 - **Commands.** `/away [on|off]` and `/ping [on|off]` work in the terminal, the dashboard and from your own Discord DM. With no argument they toggle. Turning away on also turns pings on. Each reply is a small panel showing away-mode and ping-mode, then what changed.
 
@@ -42,6 +42,7 @@ Keep `transport_fallback` set to `builtin`. Without it, an approval the plugin c
 
 - Approvals from profile-routed subagents (for example the orchestrator delegating to devops) don't get buttons. You get a DM saying the session needs approval in the terminal.
 - Questions in a Discord session are not sent here. The gateway already shows them in the channel.
+- In the TUI, a question answered in Discord still shows as open until the whole batch is done. Press Tab to move to the next question.
 - Not covered: the action gate, MCP elicitation, and sudo and secret prompts.
 - While away is off, every approval logs two warning lines. This is expected.
 - It shares the gateway's bot token. Long uptimes and frequent gateway restarts are untested.
@@ -70,3 +71,8 @@ Start in a classic CLI session on the gateway, with the DM with the bot open on 
 - **L10:** Type `/away off`, trigger L2 again, and the normal CLI prompt shows with no DM. Two warning lines in the log are expected.
 - **L11 (recovery):** Run `hermes config set security.approval.transport builtin` and trigger L2. The normal prompt shows. Set it back to `discord-away`.
 - **L12 (long command):** With away on, trigger a flagged command longer than 1500 characters. The card shows the start of it with "(cut short)" and only a Deny button.
+- **L13 (Ink TUI):** With away on, ask "use clarify to ask me two questions at once: red or blue, and small or large". Two DMs arrive, "(1 of 2)" and "(2 of 2)". Tap Blue on card 1 and it says "Answered: Blue". The TUI still shows question 1 open, which is expected. Answer question 2 in the TUI. The agent gets both answers and the TUI panel closes.
+- **L14 (Ink TUI):** Answer question 1 in the TUI, then tap a choice on card 1 in Discord. It replies "Answered in the terminal." At settle the card switches to "Answered in the terminal."
+- **L15 (Ink TUI):** Tap Blue, then answer Red for question 1 in the TUI and finish. The agent gets Red, and the card switches to "Answered in the terminal."
+- **L16 (classic CLI):** Answer both questions in Discord. The CLI panel closes. Repeat, answering one in Discord and finishing in the CLI. The agent gets the CLI answers, and the Discord card switches.
+- **L17 (expiry):** Run `hermes config set agent.clarify_timeout 30`, answer one question in Discord and wait. The open card says "This request is no longer open.", and the agent reports one answer. Reset the timeout, then repeat with Ctrl+C.

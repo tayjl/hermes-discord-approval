@@ -35,9 +35,13 @@ class MP:
         self.undo.append((os.environ, k, os.environ.get(k)))
         os.environ[k] = v
 
+    def setitem(self, d, k, v):
+        self.undo.append((d, k, d.get(k)))
+        d[k] = v
+
     def close(self):
         for o, n, v in reversed(self.undo):
-            if o is os.environ:
+            if isinstance(o, dict) or o is os.environ:
                 o.pop(n, None) if v is None else o.__setitem__(n, v)
             else:
                 setattr(o, n, v)
