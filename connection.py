@@ -64,6 +64,7 @@ class Connection:
         self.loop = None
         self.client = None
         self.ready_event = threading.Event()
+        self.failed = False  # no usable token: retrying can't help, so ready() raises at once
         self.delay = BACKOFF_START_S
         self._stopping = False
         self._task = None
@@ -80,6 +81,9 @@ class Connection:
         self._task = asyncio.current_task()
         token = self._token
         try:
+            if not token:
+                self._fail("no token")
+                return
             while not self._stopping:
                 client = self.client = discord.Client(intents=discord.Intents.none())
 
@@ -92,6 +96,9 @@ class Connection:
                 client.event(on_interaction)
                 try:
                     await client.start(token, reconnect=True)
+                except discord.LoginFailure as e:
+                    self._fail(type(e).__name__)
+                    return
                 except Exception as e:
                     # Type only: never put anything from the login path in a log line.
                     logger.warning("discord-approval: connection failed (%s), retrying in %ss", type(e).__name__, self.delay)
@@ -107,16 +114,21 @@ class Connection:
                 except Exception:
                     pass
 
+    def _fail(self, why):
+        self.failed = True
+        self.ready_event.set()  # wakes anyone waiting in ready()
+        logger.warning("discord-approval: cannot log in (%s), not retrying", why)
+
     def close(self):
         self._stopping = True
-        if self.loop is not None and self._task is not None:
-            self.loop.call_soon_threadsafe(self._task.cancel)
-        if self._thread.is_alive():
+        if self._thread.is_alive():  # after a failed login the loop is already closed
+            if self.loop is not None and self._task is not None:
+                self.loop.call_soon_threadsafe(self._task.cancel)
             self._thread.join(5)
 
     def ready(self, timeout):
-        if not self.ready_event.wait(timeout):
-            raise PassThrough("discord not ready")
+        if not self.ready_event.wait(timeout) or self.failed:
+            raise PassThrough("discord login failed" if self.failed else "discord not ready")
         return self.client
 
     def submit(self, coro):
@@ -132,18 +144,21 @@ class Connection:
 
 def capture_token():
     """Read the token and user id once where a secret scope exists (register), for threads that have none."""
-    global _token, _user_ids
+    global _token, _user_ids, _conn
     try:
         _token = get_secret("DISCORD_BOT_TOKEN") or _token
         _user_ids = get_secret("DISCORD_ALLOWED_USERS") or _user_ids
     except Exception as e:
         logger.warning("discord-approval: could not read the secrets at load (%s)", type(e).__name__)
+    with _lock:
+        if _conn is not None and _conn.failed and _conn._token != _token:
+            _conn = None  # a corrected token gets a fresh login without a restart
 
 
 def get():
     global _conn
     with _lock:
-        if _conn is None or not _conn._thread.is_alive():  # a crashed thread is replaced
+        if _conn is None or not (_conn._thread.is_alive() or _conn.failed):  # a crashed thread is replaced, a failed login is not
             _conn = Connection(_token or get_secret("DISCORD_BOT_TOKEN"))
             _conn._thread.start()
             logger.info("discord-approval: connection thread started")

@@ -396,3 +396,81 @@ def test_user_id_captured_at_register_is_read_without_a_secret_scope(monkeypatch
     worker.start()
     worker.join(3)
     assert found == [OWNER]
+
+
+def _log_records():
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    connection.logger.addHandler(handler)
+    return records, handler
+
+
+def test_a_login_failure_stops_retrying_and_ready_raises_at_once(monkeypatch):
+    secrets(monkeypatch)
+
+    async def script(client, call):
+        raise discord.LoginFailure("bad token abc123")
+
+    _patch_client(monkeypatch, script)
+    records, handler = _log_records()
+    try:
+        conn = connection.get()
+        conn._thread.join(3)
+        assert not conn._thread.is_alive() and conn.failed
+        start = time.monotonic()
+        try:
+            connection.ready(10)
+            assert False, "expected PassThrough"
+        except connection.PassThrough:
+            pass
+        assert time.monotonic() - start < 1
+        assert connection.get() is conn  # a failed login is not replaced and not retried
+        assert len(FakeClient.instances) == 1
+    finally:
+        connection.logger.removeHandler(handler)
+        connection.stop()
+    warnings = [r.getMessage() for r in records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "LoginFailure" in warnings[0] and "abc123" not in warnings[0]
+
+
+def test_a_corrected_token_replaces_a_failed_login(monkeypatch):
+    secrets(monkeypatch, token="wrong")
+    monkeypatch.setattr(connection, "_token", None)
+
+    async def script(client, call):
+        if call == 1:
+            raise discord.LoginFailure("bad")
+        await asyncio.Event().wait()
+
+    _patch_client(monkeypatch, script)
+    try:
+        connection.capture_token()
+        failed = connection.get()
+        failed._thread.join(3)
+        assert failed.failed
+        connection.capture_token()
+        assert connection.get() is failed  # the same token is not retried
+        secrets(monkeypatch, token="right")
+        connection.capture_token()
+        fresh = connection.get()
+        assert fresh is not failed and fresh._token == "right"
+    finally:
+        connection.stop()
+
+
+def test_a_missing_token_never_starts_a_client(monkeypatch):
+    secrets(monkeypatch, token=None)
+    _patch_client(monkeypatch)
+    monkeypatch.setattr(connection, "_token", None)
+    try:
+        conn = connection.get()
+        conn._thread.join(3)
+        try:
+            conn.ready(10)
+            assert False, "expected PassThrough"
+        except connection.PassThrough:
+            pass
+        assert FakeClient.instances == []
+    finally:
+        connection.stop()

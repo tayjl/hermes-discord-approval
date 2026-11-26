@@ -7,6 +7,7 @@ import hermes_constants
 from gateway import session_server_requests as ssr
 from gateway.session_authorities import owner_scope
 from gateway.session_events import SessionEvents
+from fakes import FakeCtx
 from hda import flows
 from hermes_constants import hermes_home_key
 from test_flows import _setup, _wait
@@ -34,8 +35,9 @@ def test_two_questions_give_two_cards_in_order_with_a_counter_and_no_buttons(mon
     fake, on_prompt, _ = _hooks(monkeypatch)
     _batch(on_prompt, "srq-a", _q("q0", "Red or blue?"), _q("q1", "Small or large?"))
     assert fake.sent == [
-        (flows.framed(flows.QUESTION_CARD.format(title="My session", question="(1 of 2) Red or blue?"), flows.ANSWER_IN_TERMINAL), []),
-        (flows.framed(flows.QUESTION_CARD.format(title="My session", question="(2 of 2) Small or large?"), flows.ANSWER_IN_TERMINAL), []),
+        (flows.with_status(flows.QUESTION_CARD.format(title="My session", question="(1 of 2) Red or blue?"), flows.ANSWER_IN_TERMINAL), []),
+        (flows.with_status("(2 of 2) Small or large?", flows.ANSWER_IN_TERMINAL), []),
+        (flows.FOOTER, []),
     ]
     assert fake.selects == []
     assert set(flows._questions) == {"srq-a.q0", "srq-a.q1"}
@@ -82,9 +84,21 @@ def test_worst_case_card_with_status_fits_discord(monkeypatch):
     fake, on_prompt, _ = _hooks(monkeypatch)
     monkeypatch.setattr(flows, "_lookup_title", lambda session_id: "t" * 100)
     _batch(on_prompt, "srq-a", *[_q(f"q{n}", "q" * 5000) for n in range(5)])
-    assert len(fake.sent) == 5
+    assert len(fake.sent) == 6  # five cards and the closing footer
     assert all(len(text) < 2000 for text, _ in fake.sent)
     assert all(len(flows.with_status(text, flows.CLOSED)) < 2000 for text, _ in fake.sent)
+
+
+def test_astral_question_fits_discord_in_utf16_units(monkeypatch):
+    # Discord counts UTF-16 units: an emoji is two.
+    fake, on_prompt, _ = _hooks(monkeypatch)
+    title = "t" * 100
+    monkeypatch.setattr(flows, "_lookup_title", lambda session_id: title)
+    longest = max(flows.STATUS_LINES, key=flows._units)
+    _batch(on_prompt, "srq-a", *[_q(f"q{n}", "\U0001F600" * 1000) for n in range(3)])
+    cards = [text for text, _ in fake.sent[:3]] + [flows._card(title, "\U0001F600" * 1000)]
+    assert all(flows._units(flows.with_status(text, longest)) < 2000 for text in cards)
+    assert all(flows._units(text) < 2000 for text, _ in fake.sent)
 
 
 # --- full mode: the terminal's own record, driven through the real session_server_requests ---
@@ -142,7 +156,7 @@ def _status(calls):
 
 def test_full_cards_have_real_controls_in_order(monkeypatch):
     fake, term, _ = _full(monkeypatch)
-    assert [len(buttons) for _, buttons in fake.sent] == [3, 3]  # two choices and Answer
+    assert [len(buttons) for _, buttons in fake.sent] == [3, 3, 0]  # two choices and Answer, then the footer
     assert "(1 of 2) Red or blue?" in fake.sent[0][0] and "(2 of 2) Small or large?" in fake.sent[1][0]
     assert fake.sent[0][1][1][1] == term.cid("q0", 1)
     assert set(flows._questions) == {f"{term.rid}.q0", f"{term.rid}.q1"}
@@ -271,10 +285,12 @@ def test_no_terminal_record_sends_nothing(monkeypatch):
     assert fake.sent == [] and flows._questions == {}
 
 
-def test_a_qid_with_a_colon_sends_nothing(monkeypatch):
-    fake, term, _ = _full(monkeypatch, questions=[{**QUESTIONS[0], "qid": "q:0"}])
-    assert fake.sent == [] and flows._questions == {}
-    term.end()
+def test_a_qid_that_cannot_be_a_custom_id_gives_plain_cards(monkeypatch):
+    for qid in ("q:0", "q" * 90):
+        fake, term, _ = _full(monkeypatch, questions=[{**QUESTIONS[0], "qid": qid}])
+        assert len(fake.sent) == 1 and fake.sent[0][1] == [] and flows.ANSWER_IN_TERMINAL in fake.sent[0][0]
+        assert flows._batches == {}
+        term.end()
 
 
 def test_another_sessions_prompt_sends_nothing(monkeypatch):
@@ -325,7 +341,7 @@ def test_the_profile_override_is_set_inside_owner_scope(monkeypatch, tmp_path):
 
 def test_a_card_still_being_sent_when_the_terminal_answers_ends_as_answered_in_the_terminal(monkeypatch):
     fake, _, _ = _hooks(monkeypatch)
-    entry = flows.Entry("Question?", [])
+    entry = flows.Entry(flows.framed("Question?"), [])
     flows._settle(entry, None, flows.ANSWERED_IN_TERMINAL)  # no message yet, so nothing to edit
     assert fake.edits == []
     asyncio.run(flows._send_question(entry, [], None))
@@ -340,3 +356,132 @@ def test_the_same_multi_select_answer_from_the_terminal_keeps_the_discord_card(m
     fake.click(term.cid("q1", 0))
     on_settled(prompt_id=term.rid)
     assert fake.edits == []
+
+
+# --- layout of a batch: header on the first card, only the question on the rest, footer last ---
+
+def _no_frame(text):
+    return flows.HEADER not in text and flows.FOOTER not in text and "```" not in text and not any(c in text for c in "\u256d\u256e\u2570\u256f\u2500\u200b")
+
+
+def _three(monkeypatch):
+    fake, on_prompt, on_settled = _hooks(monkeypatch)
+    _batch(on_prompt, "srq-a", _q("q0", "one"), _q("q1", "two"), _q("q2", "three"))
+    return fake, on_settled
+
+
+def test_a_batch_has_the_header_once_only_the_question_after_and_the_footer_last(monkeypatch):
+    fake, _ = _three(monkeypatch)
+    texts = [text for text, _ in fake.sent]
+    assert len(texts) == 4
+    assert texts[0].startswith(flows.HEADER) and flows.FOOTER not in texts[0]
+    for i, text in enumerate(texts[1:3], 2):
+        assert text.startswith(f"({i} of 3) ") and "**Question**" not in text and _no_frame(text)
+    assert texts[3] == flows.FOOTER and fake.sent[3][1] == []
+    assert "(1 of 3)" in texts[0] and "(2 of 3)" in texts[1] and "(3 of 3)" in texts[2]
+
+
+def test_one_question_stays_one_message_with_header_and_footer(monkeypatch):
+    fake, on_prompt, _ = _hooks(monkeypatch)
+    _batch(on_prompt, "srq-a", _q("q0", "one"))
+    assert len(fake.sent) == 1 and fake.sent[0][0].startswith(flows.HEADER) and fake.sent[0][0].endswith(flows.FOOTER)
+
+
+def test_status_edits_keep_the_layout_and_never_add_a_footer(monkeypatch):
+    fake, on_settled = _three(monkeypatch)
+    expected = flows.with_status(flows._questions["srq-a.q0"].text, flows.CLOSED)  # the plain card's own status is replaced
+    on_settled(prompt_id="srq-a")
+    assert [m for m, _ in fake.edits] == [1, 2, 3]  # the footer message is never edited
+    first, second, third = (text for _, text in fake.edits)
+    assert first == expected and first.startswith(flows.HEADER) and flows.ANSWER_IN_TERMINAL not in first
+    assert second.startswith("(2 of 3) ") and third.startswith("(3 of 3) ")
+    assert "**Question**" not in second and "**Question**" not in third
+    assert _no_frame(second) and _no_frame(third) and flows.FOOTER not in first
+    assert all(flows.FOOTER not in text and text.endswith(f"**{flows.CLOSED}**") for text in (first, second, third))
+
+
+def test_a_click_on_a_batch_card_keeps_its_layout(monkeypatch):
+    fake, term, _ = _full(monkeypatch)
+    for n, qid in enumerate(("q0", "q1")):
+        text = fake.sent[n][0]
+        edited = _status(fake.click(term.cid(qid, 0), content=text))
+        assert edited == f"{text}\n\n**{flows.ANSWERED.format(answer=QUESTIONS[n]['choices'][0])}**" and flows.FOOTER not in edited
+    assert flows.FOOTER not in _status(fake.click(term.cid("q0", 1), content=fake.sent[0][0]))  # a closed card too
+
+
+def test_a_failed_send_partway_still_lets_the_cards_sent_settle(monkeypatch):
+    fake, on_prompt, on_settled = _hooks(monkeypatch)
+    real = fake.send_dm
+
+    async def flaky(text, buttons=(), select=None):
+        if len(fake.sent) == 1:
+            raise RuntimeError("discord down")
+        return await real(text, buttons, select)
+
+    monkeypatch.setattr(flows.connection, "send_dm", flaky)
+    _batch(on_prompt, "srq-a", _q("q0", "one"), _q("q1", "two"), _q("q2", "three"))
+    assert len(fake.sent) == 1  # order is strict: nothing after the failure was sent
+    on_settled(prompt_id="srq-a")
+    assert [(m, flows.CLOSED in text) for m, text in fake.edits] == [(1, True)] and flows._questions == {}
+
+
+# --- Discord limits and the modal payload ---
+
+def test_24_choices_and_long_labels_fit_discord_limits(monkeypatch):
+    buttons, _ = flows._controls("srq-" + "a" * 20 + ".q0", [f"{n}" + "L" * 200 for n in range(24)], False)
+    assert len(buttons) == 25  # 24 choices and Answer
+    assert all(len(label) <= 80 and len(cid) <= 100 for label, cid, _ in buttons)
+    assert flows._controls("k", [str(n) for n in range(25)], False)[0][0][0] == flows.ANSWER_BUTTON  # 25 choices: Answer only
+    assert flows._fits("srq-" + "a" * 20 + ".q0")
+    assert not flows._fits("k" * 88) and flows._fits("k" * 87)  # "hda:c:" + key + ":answer" is at most 100
+
+
+def test_the_card_for_a_long_prompt_id_has_no_buttons(monkeypatch):
+    fake, on_prompt, _ = _hooks(monkeypatch)
+    from tools import clarify_gateway
+    long_id = "p" * 95
+    clarify_gateway.register(long_id, "session-a", "Q?", ["x"], authority={})
+    try:
+        on_prompt(session_id="s1", kind="clarify", prompt_id=long_id)
+    finally:
+        clarify_gateway._entries.pop(long_id, None)
+    assert fake.sent[0][1] == [] and flows.ANSWER_IN_TERMINAL in fake.sent[0][0]
+
+
+def test_modal_text_is_read_from_the_raw_payload(monkeypatch):
+    rows = [{"type": 1, "components": [{"type": 4, "custom_id": "other", "value": "no"}, {"type": 4, "custom_id": "answer", "value": " yes "}]}]
+    assert flows._modal_value(rows) == " yes "
+    assert flows._modal_value([{"type": 18, "component": {"type": 4, "custom_id": "answer", "value": "label"}}]) == "label"
+    assert flows._modal_value(None) == "" and flows._modal_value([{"type": 1, "components": []}]) == ""
+
+
+def test_lock_answer_raising_a_type_error_closes_the_card_instead_of_killing_the_click(monkeypatch):
+    fake, term, _ = _full(monkeypatch)
+
+    def broken(*a, **k):
+        raise TypeError("signature changed")
+    monkeypatch.setattr(ssr, "lock_answer", broken)
+    assert flows.CLOSED in _status(fake.click(term.cid("q0", 1)))
+    assert flows._batches[term.rid][1]["q0"].sent is None
+    term.end()
+
+
+def test_settle_without_the_terminal_record_attributes_just_closes_the_cards(monkeypatch):
+    fake, term, on_settled = _full(monkeypatch)
+    flows._batches[term.rid] = (object(), flows._batches[term.rid][1], "s1")  # no .result, no .locked
+    on_settled(prompt_id=term.rid)
+    assert sorted(m for m, _ in fake.edits) == [1, 2] and all(flows.CLOSED in text for _, text in fake.edits)
+    term.end()
+
+
+def test_old_cards_are_swept_and_closed_at_the_next_turn(monkeypatch):
+    fake, on_prompt, _ = _hooks(monkeypatch)
+    _batch(on_prompt, "srq-a", _q("q0", "one"), _q("q1", "two"))
+    on_prompt(session_id="s1", kind="approval", prompt_id="req-1")
+    assert len(flows._questions) == 3
+    flows._batches["srq-a"] = (None, {"q0": flows._questions["srq-a.q0"]}, "s1")
+    for entry in flows._questions.values():
+        entry.created -= flows.MAX_AGE_S + 1
+    flows.make_ping_hooks(FakeCtx({"away": True}))[0](session_id="s1", turn_id="t1")
+    assert flows._questions == {} and flows._batches == {}
+    assert sorted(m for m, _ in fake.edits) == [1, 2, 4] and all(flows.CLOSED in text for _, text in fake.edits)
