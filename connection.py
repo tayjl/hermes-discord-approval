@@ -205,9 +205,9 @@ def stop():
 
 async def close_card(interaction):
     """Final state for an unknown or finished request. The edit is the ack."""
-    from .flows import CLOSED
+    from .flows import CLOSED, with_status
     message = interaction.message
-    await interaction.response.edit_message(content=f"{message.content}\n\n{CLOSED}", view=None)
+    await interaction.response.edit_message(content=with_status(message.content, CLOSED), view=None)
 
 
 async def on_interaction(interaction):

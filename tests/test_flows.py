@@ -86,7 +86,7 @@ def test_card_has_once_session_deny_and_never_always(monkeypatch):
     assert "rm -rf /tmp/example" in text and "recursive delete" in text and flows.UNTITLED in text
     assert "Answer within 5 minutes or it is denied." in text
     # a forged always click is refused like any unknown choice
-    assert fake.click(f"hda:a:{request.request_id}:always")[0][1].endswith(flows.CLOSED)
+    assert flows.CLOSED in fake.click(f"hda:a:{request.request_id}:always")[0][1]
     fake.click(_custom_id(fake, "deny"))
     run.finish()
 
@@ -106,7 +106,7 @@ def test_click_once_responds_and_edits_card_without_view(monkeypatch):
     run = Running(present, request)
     _wait(lambda: fake.sent)
     calls = fake.click(_custom_id(fake, "once"), content="card")
-    assert calls == [("edit_message", "card\n\n" + flows.ALLOWED_ONCE, None)]
+    assert calls == [("edit_message", flows.with_status("card", flows.ALLOWED_ONCE), None)]
     decision = run.finish().result
     assert (decision.request_id, decision.request_digest, decision.choice) == (request.request_id, request.digest, "once")
 
@@ -115,12 +115,12 @@ def test_click_session_and_deny_edit_text(monkeypatch):
     _, fake, present = _setup(monkeypatch)
     run = Running(present, _req())
     _wait(lambda: fake.sent)
-    assert fake.click(_custom_id(fake, "session"), content="c")[0][1] == "c\n\n" + flows.ALLOWED_SESSION
+    assert fake.click(_custom_id(fake, "session"), content="c")[0][1] == flows.with_status("c", flows.ALLOWED_SESSION)
     assert run.finish().result.choice == "session"
     fake.sent.clear()
     run = Running(present, _req())
     _wait(lambda: fake.sent)
-    assert fake.click(_custom_id(fake, "deny"), content="c")[0][1] == "c\n\n" + flows.DENIED
+    assert fake.click(_custom_id(fake, "deny"), content="c")[0][1] == flows.with_status("c", flows.DENIED)
     assert run.finish().result.choice == "deny"
 
 
@@ -131,7 +131,7 @@ def test_deadline_is_shorter_than_host_timeout_and_denies(monkeypatch):
     decision = present(_req(timeout_seconds=20))
     assert decision.choice == "deny"
     assert "Answer within 5 seconds" in fake.sent[0][0]  # max(10, 20 - 15) minus the 5 s the clock showed before the card
-    assert fake.edits == [(1, fake.sent[0][0] + "\n\n" + flows.TIMED_OUT)]
+    assert fake.edits == [(1, flows.with_status(fake.sent[0][0], flows.TIMED_OUT))]
 
 
 def test_away_flipping_off_mid_wait_raises_and_moves_card(monkeypatch):
@@ -140,9 +140,9 @@ def test_away_flipping_off_mid_wait_raises_and_moves_card(monkeypatch):
     _wait(lambda: fake.sent)
     ctx.config["away"] = False
     assert isinstance(run.finish().error, connection.PassThrough)
-    assert fake.edits == [(1, fake.sent[0][0] + "\n\n" + flows.MOVED_TO_TERMINAL)]
+    assert fake.edits == [(1, flows.with_status(fake.sent[0][0], flows.MOVED_TO_TERMINAL))]
     # the card is closed, so a late click is refused
-    assert fake.click(_custom_id(fake, "once"), content="x")[0][1].endswith(flows.CLOSED)
+    assert flows.CLOSED in fake.click(_custom_id(fake, "once"), content="x")[0][1]
 
 
 def test_other_user_gets_not_yours_and_nothing_resolves(monkeypatch):
@@ -162,8 +162,8 @@ def test_second_click_and_unknown_id_are_closed(monkeypatch):
     _wait(lambda: fake.sent)
     fake.click(_custom_id(fake, "once"))
     run.finish()
-    assert fake.click(_custom_id(fake, "deny"), content="c") == [("edit_message", "c\n\n" + flows.CLOSED, None)]
-    assert fake.click("hda:a:unknown:once", content="c") == [("edit_message", "c\n\n" + flows.CLOSED, None)]
+    assert fake.click(_custom_id(fake, "deny"), content="c") == [("edit_message", flows.with_status("c", flows.CLOSED), None)]
+    assert fake.click("hda:a:unknown:once", content="c") == [("edit_message", flows.with_status("c", flows.CLOSED), None)]
 
 
 def test_post_response_closes_a_still_open_card_and_wakes_present(monkeypatch):
@@ -173,7 +173,7 @@ def test_post_response_closes_a_still_open_card_and_wakes_present(monkeypatch):
     _wait(lambda: fake.sent)
     flows.post_approval_response(request_id=request.request_id, surface=flows.SURFACE, choice="transport_timeout")
     assert run.finish().result.choice == "deny"
-    assert fake.edits == [(1, fake.sent[0][0] + "\n\n" + flows.CLOSED)]
+    assert fake.edits == [(1, flows.with_status(fake.sent[0][0], flows.CLOSED))]
     flows.post_approval_response(request_id=request.request_id, surface=flows.SURFACE)  # second call is harmless
     assert len(fake.edits) == 1
 
@@ -221,10 +221,39 @@ def test_long_command_is_clipped_and_backticks_neutralised(monkeypatch):
     _wait(lambda: fake.sent)
     text, buttons = fake.sent[0]
     assert flows.CUT_SHORT in text and "x" * 1500 not in text and len(text) < 2000
-    assert text.count("```") == 2  # only the card's own fence
-    assert text.endswith(flows.TOO_LONG)
+    assert text.count("```") == 6  # header, code box and footer only
+    assert text.removesuffix(f"\n{flows.FOOTER}").endswith(flows.TOO_LONG)
     assert [label for label, _, _ in buttons] == [flows.BTN_DENY]  # the hidden tail can't be approved
-    assert fake.click(f"hda:a:{request.request_id}:once")[0][1].endswith(flows.CLOSED)
+    assert flows.CLOSED in fake.click(f"hda:a:{request.request_id}:once")[0][1]
+    fake.click(_custom_id(fake, "deny"))
+    run.finish()
+
+
+def test_worst_case_cards_and_their_edited_form_fit_discord(monkeypatch):
+    _, fake, present = _setup(monkeypatch)
+    title = "T" * flows.TITLE_CHARS
+    monkeypatch.setattr(flows, "_lookup_title", lambda session_id: title)
+    request = ApprovalRequest.create(
+        command="`" * 5000, description="d" * 1000, pattern_key="k", pattern_keys=("k",),  # backticks double once broken up
+        session_key="session-a", surface="cli", allow_session=True, allow_permanent=True, timeout_seconds=300)
+    flows._titles[request.request_id] = title
+    run = Running(present, request)
+    _wait(lambda: fake.sent)
+    text = fake.sent[0][0]
+    assert flows.TOO_LONG in text and len(text) < 2000
+    assert len(flows.with_status(text, flows.TIMED_OUT)) < 2000
+    fake.click(_custom_id(fake, "deny"))
+    run.finish()
+    card = flows.framed(flows.QUESTION_CARD.format(title=title, question="q" * flows.QUESTION_CHARS))
+    assert len(flows.with_status(card, flows.ANSWERED.format(answer="a" * flows.ANSWER_CHARS))) < 2000
+
+
+def test_command_cannot_fake_colours_or_close_the_box(monkeypatch):
+    _, fake, present = _setup(monkeypatch)
+    run = Running(present, _req(command="a\x1b[31mred\x1b[0m\x07\tb\r\nc"))
+    _wait(lambda: fake.sent)
+    text = fake.sent[0][0]
+    assert "a[31mred[0m\tb\nc" in text  # tab and newline stay
     fake.click(_custom_id(fake, "deny"))
     run.finish()
 
@@ -243,7 +272,7 @@ def test_four_or_more_backticks_cannot_close_the_fence(monkeypatch):
         _, fake, present = _setup(monkeypatch)
         run = Running(present, _req(command="a" + "`" * ticks + "\n**Why:** fine"))
         _wait(lambda: fake.sent)
-        assert fake.sent[0][0].count("```") == 2, ticks
+        assert fake.sent[0][0].count("```") == 6, ticks
         fake.click(_custom_id(fake, "deny"))
         run.finish()
 
@@ -277,7 +306,7 @@ def test_title_from_pre_hook_is_in_the_card(monkeypatch):
     flows.make_pre_approval_request(ctx)(request_id=request.request_id, session_id="s1", surface=flows.SURFACE)
     run = Running(present, request)
     _wait(lambda: fake.sent)
-    assert "Session: Title of s1\n" in fake.sent[0][0] and flows._titles == {}
+    assert "**Approval needed** | __Title of s1__\n" in fake.sent[0][0] and flows._titles == {}
     fake.click(_custom_id(fake, "deny"))
     run.finish()
 
@@ -304,7 +333,7 @@ def test_approval_prompt_notice_sends_text_without_buttons(monkeypatch):
     notice(session_id="s1", kind="sudo", prompt_id="p")
     assert fake.sent == []
     notice(session_id="s1", kind="approval", prompt_id="p")
-    assert fake.sent == [(flows.SUBAGENT_WAITING.format(title="My session"), [])]
+    assert fake.sent == [(flows.framed(flows.SUBAGENT_WAITING.format(title="My session")), [])]
     ctx.config["away"] = False
     notice(session_id="s1", kind="approval", prompt_id="p")
     assert len(fake.sent) == 1
@@ -376,7 +405,7 @@ def test_spike_flip_off_mid_wait_surfaces_builtin(monkeypatch):
     threading.Thread(target=lambda: (_wait(lambda: fake.sent), ctx.config.update(away=False))).start()
     calls, result = _host_run(approval)
     assert calls == ["builtin"] and result["approved"] is True
-    assert fake.edits[-1][1].endswith(flows.MOVED_TO_TERMINAL)
+    assert flows.MOVED_TO_TERMINAL in fake.edits[-1][1]
 
 
 def test_spike_without_fallback_a_raise_denies(monkeypatch):

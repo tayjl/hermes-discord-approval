@@ -32,20 +32,20 @@ def _clarify(monkeypatch, question="Which colour?", choices=("Red", "Blue"), mul
 def test_clarify_choices_give_buttons_and_a_click_answers_the_waiter(monkeypatch):
     prompt_id, fake, answer, _ = _clarify(monkeypatch)
     text, buttons = fake.sent[0]
-    assert text == flows.QUESTION_CARD.format(title="My session", question="Which colour?")
+    assert text == flows.framed(flows.QUESTION_CARD.format(title="My session", question="Which colour?"))
     assert [(label, cid) for label, cid, _ in buttons] == [
         ("Red", f"hda:c:{prompt_id}:0"), ("Blue", f"hda:c:{prompt_id}:1"), (flows.ANSWER_BUTTON, f"hda:c:{prompt_id}:answer"),
     ]
     assert fake.click(f"hda:c:{prompt_id}:1", content="card") == [
-        ("edit_message", "card\n\n" + flows.ANSWERED.format(answer="Blue"), None)]
+        ("edit_message", flows.with_status("card", flows.ANSWERED.format(answer="Blue")), None)]
     assert answer() == "Blue"
-    assert fake.click(f"hda:c:{prompt_id}:0", content="card")[0][1].endswith(flows.CLOSED)  # second click
+    assert flows.CLOSED in fake.click(f"hda:c:{prompt_id}:0", content="card")[0][1]  # second click
 
 
 def test_clarify_forged_choice_index_is_closed(monkeypatch):
     prompt_id, fake, answer, _ = _clarify(monkeypatch)
-    assert fake.click(f"hda:c:{prompt_id}:9")[0][1].endswith(flows.CLOSED)
-    assert fake.click(f"hda:c:{prompt_id}:-1")[0][1].endswith(flows.CLOSED)
+    assert flows.CLOSED in fake.click(f"hda:c:{prompt_id}:9")[0][1]
+    assert flows.CLOSED in fake.click(f"hda:c:{prompt_id}:-1")[0][1]
     fake.click(f"hda:c:{prompt_id}:0")
     assert answer() == "Red"
 
@@ -54,10 +54,10 @@ def test_clarify_multi_select_menu_sends_a_json_list(monkeypatch):
     prompt_id, fake, answer, _ = _clarify(monkeypatch, choices=("a", "b", "c"), multi=True)
     assert [label for label, _, _ in fake.sent[0][1]] == [flows.ANSWER_BUTTON]
     assert fake.selects == [(flows.SELECT_HINT, f"hda:cs:{prompt_id}", [("a", "0"), ("b", "1"), ("c", "2")])]
-    assert fake.select(f"hda:cs:{prompt_id}", ["7"])[0][1].endswith(flows.CLOSED)  # not an option
-    assert fake.select(f"hda:cs:{prompt_id}", [])[0][1].endswith(flows.CLOSED)
+    assert flows.CLOSED in fake.select(f"hda:cs:{prompt_id}", ["7"])[0][1]  # not an option
+    assert flows.CLOSED in fake.select(f"hda:cs:{prompt_id}", [])[0][1]
     calls = fake.select(f"hda:cs:{prompt_id}", ["0", "2"], content="card")
-    assert calls == [("edit_message", "card\n\n" + flows.ANSWERED.format(answer='["a", "c"]'), None)]
+    assert calls == [("edit_message", flows.with_status("card", flows.ANSWERED.format(answer='["a", "c"]')), None)]
     assert answer() == '["a", "c"]'
 
 
@@ -67,7 +67,7 @@ def test_clarify_open_question_opens_a_modal_and_passes_text_through(monkeypatch
     assert fake.click(f"hda:c:{prompt_id}:answer") == [("send_modal", f"hda:cm:{prompt_id}", flows.MODAL_TITLE)]
     text = "  green  " + "g" * 300
     calls = fake.submit_modal(f"hda:cm:{prompt_id}", text, content="card")
-    assert calls == [("edit_message", "card\n\n" + flows.ANSWERED.format(answer=text.strip()[:200]), None)]
+    assert calls == [("edit_message", flows.with_status("card", flows.ANSWERED.format(answer=text.strip()[:200])), None)]
     assert answer() == text.strip()  # the agent gets it whole, trimmed
 
 
@@ -91,8 +91,8 @@ def test_clarify_too_many_or_empty_labels_fall_back_to_answer_only(monkeypatch):
 
 def test_clarify_non_ascii_digit_index_is_closed_not_raised(monkeypatch):
     prompt_id, fake, answer, _ = _clarify(monkeypatch)
-    assert fake.click(f"hda:c:{prompt_id}:²")[0][1].endswith(flows.CLOSED)
-    assert fake.select(f"hda:cs:{prompt_id}", ["²"])[0][1].endswith(flows.CLOSED)
+    assert flows.CLOSED in fake.click(f"hda:c:{prompt_id}:²")[0][1]
+    assert flows.CLOSED in fake.select(f"hda:cs:{prompt_id}", ["²"])[0][1]
     fake.click(f"hda:c:{prompt_id}:0")
 
 
@@ -100,8 +100,8 @@ def test_clarify_resolver_false_closes_the_card(monkeypatch):
     from tools import clarify_gateway
     prompt_id, fake, answer, _ = _clarify(monkeypatch)
     assert clarify_gateway.resolve_gateway_clarify(prompt_id, "answered in the CLI")
-    assert fake.click(f"hda:c:{prompt_id}:0", content="card") == [("edit_message", "card\n\n" + flows.CLOSED, None)]
-    assert fake.submit_modal(f"hda:cm:{prompt_id}", "late", content="card")[0][1].endswith(flows.CLOSED)
+    assert fake.click(f"hda:c:{prompt_id}:0", content="card") == [("edit_message", flows.with_status("card", flows.CLOSED), None)]
+    assert flows.CLOSED in fake.submit_modal(f"hda:cm:{prompt_id}", "late", content="card")[0][1]
     assert answer() == "answered in the CLI"
 
 
@@ -110,7 +110,7 @@ def test_clarify_resolver_returning_false_is_closed_not_answered(monkeypatch):
     prompt_id, fake, answer, _ = _clarify(monkeypatch)
     real = clarify_gateway.resolve_gateway_clarify
     monkeypatch.setattr(clarify_gateway, "resolve_gateway_clarify", lambda *a: False)
-    assert fake.click(f"hda:c:{prompt_id}:0", content="card") == [("edit_message", "card\n\n" + flows.CLOSED, None)]
+    assert fake.click(f"hda:c:{prompt_id}:0", content="card") == [("edit_message", flows.with_status("card", flows.CLOSED), None)]
     real(prompt_id, "x")
 
 
@@ -141,8 +141,8 @@ def test_clarify_settled_closes_an_open_card_once(monkeypatch):
     from tools import clarify_gateway
     prompt_id, fake, answer, on_settled = _clarify(monkeypatch)
     on_settled(prompt_id=prompt_id, reason="timeout")
-    assert fake.edits == [(1, fake.sent[0][0] + "\n\n" + flows.CLOSED)]
-    assert fake.click(f"hda:c:{prompt_id}:0", content="card")[0][1].endswith(flows.CLOSED)
+    assert fake.edits == [(1, flows.with_status(fake.sent[0][0], flows.CLOSED))]
+    assert flows.CLOSED in fake.click(f"hda:c:{prompt_id}:0", content="card")[0][1]
     on_settled(prompt_id=prompt_id, reason="timeout")
     assert len(fake.edits) == 1
     clarify_gateway.resolve_gateway_clarify(prompt_id, "x")
@@ -216,8 +216,8 @@ def _turn(hooks, now, seconds, reply="All done.", turn="t1", parent="", complete
 def test_ping_after_181_seconds_has_outcome_duration_title_and_quoted_lines(monkeypatch):
     fake, now, hooks = _ping(monkeypatch)
     _turn(hooks, now, 181, "one\n\n  two  \nthree\nfour\nfive\nsix\nseven")
-    assert fake.sent == [(flows.PING.format(outcome="Done", duration="3 min", title="Title s1")
-                          + "\n> one\n> two\n> three\n> four\n> five", [])]
+    assert fake.sent == [(flows.framed(flows.PING.format(outcome="Done", duration="3 min", title="Title s1")
+                                       + "\n> one\n> two\n> three\n> four\n> five"), [])]
     assert flows._starts == {} and flows._replies == {}
 
 
@@ -252,13 +252,13 @@ def test_ping_duration_format_and_missing_reply(monkeypatch):
     assert flows._duration(3600) == "1 h 0 min" and flows._duration(3900) == "1 h 5 min"
     fake, now, hooks = _ping(monkeypatch)
     _turn(hooks, now, 200, reply=None)
-    assert fake.sent == [(flows.PING.format(outcome="Done", duration="3 min", title="Title s1"), [])]
+    assert fake.sent == [(flows.framed(flows.PING.format(outcome="Done", duration="3 min", title="Title s1")), [])]
 
 
 def test_ping_excerpt_is_capped(monkeypatch):
     fake, now, hooks = _ping(monkeypatch)
     _turn(hooks, now, 200, "word " * 400)
-    quoted = fake.sent[0][0].split("\n", 1)[1]
+    quoted = "> " + fake.sent[0][0].split("\n> ", 1)[1].removesuffix(f"\n{flows.FOOTER}")
     assert quoted.startswith("> word") and len(quoted) <= flows.REPLY_CHARS + 2
 
 

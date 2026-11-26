@@ -33,7 +33,16 @@ USAGE_PING = "Use /ping, /ping on or /ping off."
 NOT_ALLOWED = "Only the owner can use this."
 SAVE_FAILED = "Could not save the setting."
 
-APPROVAL_CARD = "**Approval needed**\nSession: {title}\n```\n{command}\n```\nWhy: {description}\nAnswer within {window} or it is denied."
+# Same look as the daily digest. Escape codes count toward Discord's 2000 characters.
+_YELLOW, _RESET, _REVERSED = "\x1b[1;38;2;255;216;0m", "\x1b[0m", "\x1b[7;37m"
+_RULE = "\u2500"
+HEADER = (f"```ansi\n{_YELLOW}\u256d{_RULE * 36}\u256e\n"
+          f"{_REVERSED}{'-' * 7}{_RESET}{_YELLOW}HERMES DISCORD APPROVAL{_REVERSED}{'-' * 8}{_RESET}{_YELLOW}\n"
+          f"\u2570{_RULE * 36}\u256f{_RESET}\n```")
+FOOTER = f"```ansi\n{_YELLOW}\u2570{_RULE * 36}\u256f{_RESET}\n```"
+CODE_BOX = f"```ansi\n{_YELLOW}\u250c{_RULE * 37}{_RESET}\n{{code}}\n{_YELLOW}\u2514{_RULE * 37}{_RESET}\n```"
+
+APPROVAL_CARD = HEADER + "\n**Approval needed** | __{title}__\n{code_box}\nWhy: {description}\nAnswer within {window} or it is denied."
 CUT_SHORT = "(cut short)"
 BTN_ONCE = "Allow once"
 BTN_SESSION = "Allow for this session"
@@ -46,9 +55,9 @@ MOVED_TO_TERMINAL = "Away is off. This one moved to the terminal."
 CLOSED = "This request is no longer open."
 NOT_YOURS = "This is not for you."
 UNTITLED = "Untitled session"
-SUBAGENT_WAITING = "{title} needs approval in the terminal."
+SUBAGENT_WAITING = HEADER + "\n**Waiting in the terminal** | __{title}__\n{title} needs approval in the terminal."
 
-QUESTION_CARD = "**Question**\nSession: {title}\n{question}"
+QUESTION_CARD = HEADER + "\n**Question** | __{title}__\n{question}"
 ANSWER_BUTTON = "Answer"
 SELECT_HINT = "Pick one or more"
 MODAL_TITLE = "Your answer"
@@ -58,7 +67,7 @@ EMPTY_ANSWER = "Type an answer first."
 
 TOO_LONG = "Too long to approve from here. Deny it or turn away off to see it in the terminal."
 
-PING = "**{outcome}** after {duration}: {title}"
+PING = HEADER + "\n**{outcome}** after {duration} | __{title}__"
 OUTCOME = {"completed": "Done", "failed": "Failed", "interrupted": "Stopped"}
 
 PING_AFTER_S = 180
@@ -68,11 +77,11 @@ REPLY_LINES = 5
 REPLY_CHARS = 500
 
 SURFACE = "transport:discord-away"
-COMMAND_CHARS = 1500
+COMMAND_CHARS = 1000
 TITLE_CHARS = 100
 DESCRIPTION_CHARS = 200  # keeps the card under Discord's 2000 character limit
 MAX_TITLES = 64
-QUESTION_CHARS = 1500
+QUESTION_CHARS = 1000
 LABEL_CHARS = 80
 ANSWER_CHARS = 200
 MODAL_CHARS = 1000
@@ -176,13 +185,24 @@ def _window(seconds):
 
 def approval_card(request, title, window):
     """The card text and whether the command was clipped."""
-    command = re.sub(r"`(?=``)", "`\u200b", request.command)  # a zero-width space breaks every run of 3 backticks
+    # No escape or control characters: a command must not fake colours or close the box.
+    command = re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", request.command)
+    command = re.sub(r"`(?=``)", "`\u200b", command)  # a zero-width space breaks every run of 3 backticks
     clipped = len(command) > COMMAND_CHARS
     if clipped:
         command = f"{command[:COMMAND_CHARS]}\n{CUT_SHORT}"
-    text = APPROVAL_CARD.format(title=title, command=command, window=window,
+    text = APPROVAL_CARD.format(title=title, code_box=CODE_BOX.format(code=command), window=window,
                                 description=_redact(request.description)[:DESCRIPTION_CHARS])
     return (f"{text}\n{TOO_LONG}" if clipped else text), clipped
+
+
+def framed(text, status=None):
+    """The footer goes last, so a status line sits above it."""
+    return f"{text}\n\n**{status}**\n{FOOTER}" if status else f"{text}\n{FOOTER}"
+
+
+def with_status(content, status):
+    return framed(content.removesuffix(f"\n{FOOTER}"), status)
 
 
 def _settle(entry, choice, line):
@@ -194,7 +214,7 @@ def _settle(entry, choice, line):
     entry.event.set()
     if entry.message is not None:
         try:
-            connection.submit(connection.edit_card(entry.message, f"{entry.text}\n\n{line}"))
+            connection.submit(connection.edit_card(entry.message, framed(entry.text, line)))
         except Exception:
             logger.warning("discord-approval: could not edit the card")
     return True
@@ -213,7 +233,7 @@ async def on_approval_click(interaction, parts):
     entry.event.set()
     line = {"once": ALLOWED_ONCE, "session": ALLOWED_SESSION, "deny": DENIED}[choice]
     try:
-        await interaction.response.edit_message(content=f"{interaction.message.content}\n\n{line}", view=None)
+        await interaction.response.edit_message(content=with_status(interaction.message.content, line), view=None)
     except Exception as e:
         # The choice stands, so say so: the card keeps its buttons and a second click gets CLOSED.
         logger.warning("discord-approval: choice taken but the card edit failed (%s)", type(e).__name__)
@@ -252,7 +272,7 @@ def make_present(ctx):
         with _lock:
             _pending[request.request_id] = entry
         try:
-            entry.message = connection.run(connection.send_dm(entry.text, buttons), 10)
+            entry.message = connection.run(connection.send_dm(framed(entry.text), buttons), 10)
         except Exception:
             with _lock:
                 _pending.pop(request.request_id, None)
@@ -305,9 +325,9 @@ def _send_soon(coro):
 
 
 async def _send_question(entry, buttons, select):
-    entry.message = await connection.send_dm(entry.text, buttons, select)
+    entry.message = await connection.send_dm(framed(entry.text), buttons, select)
     if entry.done:  # settled while the card was still being sent
-        await connection.edit_card(entry.message, f"{entry.text}\n\n{CLOSED}")
+        await connection.edit_card(entry.message, framed(entry.text, CLOSED))
 
 
 def _open_question(session_id, prompt_id):
@@ -355,7 +375,7 @@ async def _answer(interaction, prompt_id, answer):
             entry.done = True
     ok = entry is not None and clarify_gateway.resolve_gateway_clarify(prompt_id, answer)
     line = ANSWERED.format(answer=answer[:ANSWER_CHARS]) if ok else CLOSED
-    await interaction.response.edit_message(content=f"{interaction.message.content}\n\n{line}", view=None)
+    await interaction.response.edit_message(content=with_status(interaction.message.content, line), view=None)
 
 
 def _answer_modal(prompt_id):
@@ -421,7 +441,7 @@ def make_prompt_hooks(ctx):
                 # Profile-routed subagents use the builtin queue, so all we can do is say one is waiting.
                 # This runs on the hook worker thread, so waiting for the connection is safe.
                 connection.ready(READY_WAIT_S)
-                connection.submit(connection.send_dm(SUBAGENT_WAITING.format(title=_lookup_title(session_id))))
+                connection.submit(connection.send_dm(framed(SUBAGENT_WAITING.format(title=_lookup_title(session_id)))))
         except PassThrough as e:
             logger.warning("discord-approval: %s prompt not sent (%s)", kind, e)
 
@@ -481,7 +501,7 @@ def make_ping_hooks(ctx):
         text = PING.format(outcome=OUTCOME[outcome], duration=_duration(seconds), title=_lookup_title(started[1]))
         excerpt = _excerpt(reply)
         try:
-            _send_soon(connection.send_dm(f"{text}\n{excerpt}" if excerpt else text))
+            _send_soon(connection.send_dm(framed(f"{text}\n{excerpt}" if excerpt else text)))
         except PassThrough as e:
             logger.warning("discord-approval: ping not sent (%s)", e)
 

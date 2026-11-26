@@ -161,7 +161,7 @@ def test_router_closes_unknown_kind_with_no_view(monkeypatch):
     secrets(monkeypatch)
     monkeypatch.setattr(connection, "ROUTES", {})
     calls = FakeConnection().click("hda:a:req:once", content="Approval needed")
-    assert calls == [("edit_message", "Approval needed\n\n" + flows.CLOSED, None)]
+    assert calls == [("edit_message", flows.with_status("Approval needed", flows.CLOSED), None)]
 
 
 def test_router_passes_owner_clicks_to_the_route(monkeypatch):
