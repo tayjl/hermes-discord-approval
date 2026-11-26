@@ -1,6 +1,6 @@
 # Hermes Discord Approval
 
-Approve commands and answer your agent's questions from your phone.
+Approve commands and answer your agent's questions from your phone, without worrying about prompts hanging on an approval request.
 
 When you step away, this plugin sends approval prompts and agent questions to your Discord DM. It can also DM you after long turns.
 
