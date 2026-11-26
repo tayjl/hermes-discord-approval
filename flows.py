@@ -1,0 +1,422 @@
+"""Strings and the /away and /ping command handlers."""
+
+import json
+import logging
+import re
+import threading
+from collections import OrderedDict
+from time import monotonic
+
+from . import connection
+from .connection import PassThrough
+
+logger = logging.getLogger(__name__)
+
+AWAY_ON = "Away is on. Approvals and questions go to your Discord DMs."
+AWAY_OFF = "Away is off. Prompts go back to the terminal."
+PING_ON = "Long-turn pings are on. Turns of 3 minutes or more send you a DM."
+PING_OFF = "Long-turn pings are off."
+USAGE_AWAY = "Use /away, /away on or /away off."
+USAGE_PING = "Use /ping, /ping on or /ping off."
+NOT_ALLOWED = "Only the owner can use this."
+SAVE_FAILED = "Could not save the setting."
+
+APPROVAL_CARD = "**Approval needed**\nSession: {title}\n```\n{command}\n```\nWhy: {description}\nAnswer within {window} or it is denied."
+CUT_SHORT = "(cut short)"
+BTN_ONCE = "Allow once"
+BTN_SESSION = "Allow for this session"
+BTN_DENY = "Deny"
+ALLOWED_ONCE = "Allowed once."
+ALLOWED_SESSION = "Allowed for this session."
+DENIED = "Denied."
+TIMED_OUT = "No answer in time. Denied."
+MOVED_TO_TERMINAL = "Away is off. This one moved to the terminal."
+CLOSED = "This request is no longer open."
+NOT_YOURS = "This is not for you."
+UNTITLED = "Untitled session"
+SUBAGENT_WAITING = "A subagent in {title} needs approval in the terminal."
+
+QUESTION_CARD = "**Question**\nSession: {title}\n{question}"
+ANSWER_BUTTON = "Answer"
+SELECT_HINT = "Pick one or more"
+MODAL_TITLE = "Your answer"
+MODAL_LABEL = "Answer"
+ANSWERED = "Answered: {answer}"
+EMPTY_ANSWER = "Type an answer first."
+
+TOO_LONG = "Too long to approve from here. Deny it or turn away off to see it in the terminal."
+
+PING = "**{outcome}** after {duration}: {title}"
+OUTCOME = {"completed": "Done", "failed": "Failed", "interrupted": "Stopped"}
+
+PING_AFTER_S = 180
+DEADLINE_MARGIN_S = 15
+READY_WAIT_S = 10
+REPLY_LINES = 5
+REPLY_CHARS = 500
+
+SURFACE = "transport:discord-away"
+COMMAND_CHARS = 1500
+TITLE_CHARS = 100
+DESCRIPTION_CHARS = 200  # keeps the card under Discord's 2000 character limit
+MAX_TITLES = 64
+QUESTION_CHARS = 1500
+LABEL_CHARS = 80
+ANSWER_CHARS = 200
+MODAL_CHARS = 1000
+MAX_LABELS = 24
+ANSWER_ID = "answer"
+MAX_AGE_S = 24 * 3600  # turns that never end are dropped after this
+
+LOCAL_PLATFORMS = {"cli", "local", "desktop", "dashboard", "tui"}
+
+
+def _allowed(source, platform):
+    if platform == "discord":
+        return source is not None and str(source.user_id) == connection.user_id()
+    return platform in LOCAL_PLATFORMS
+
+
+def make_command(ctx, key, on_text, off_text, usage):
+    def handler(raw_args, source=None, platform=None):
+        if not _allowed(source, platform):
+            return NOT_ALLOWED
+        arg = (raw_args or "").strip().lower()
+        if arg == "":
+            value = not ctx.get_config(key, False)
+        elif arg in ("on", "off"):
+            value = arg == "on"
+        else:
+            return usage
+        try:
+            ctx.set_config(key, value)
+        except PermissionError:
+            return SAVE_FAILED
+        if value:
+            connection.ensure()
+        return on_text if value else off_text
+    return handler
+
+
+class Entry:
+    def __init__(self, text, choices):
+        self.text = text
+        self.choices = choices
+        self.message = None
+        self.event = threading.Event()
+        self.choice = None
+        self.done = False  # first resolution wins
+
+
+_lock = threading.Lock()
+_pending = {}  # request_id -> Entry, removed by the post_approval_response hook
+_titles = OrderedDict()  # request_id -> session title, filled by the pre hook
+
+
+def _redact(text):
+    from agent.redact import redact_approval_display
+    return redact_approval_display(text, force=True, prose=True)
+
+
+def _lookup_title(session_id):
+    try:
+        from gateway.session_context import get_session_env
+        from hermes_constants import get_hermes_home
+        from persistence_assembly import open_persistence_reader
+        with open_persistence_reader(get_hermes_home()) as persistence:
+            title = persistence.sessions.get_title(session_id or get_session_env("HERMES_SESSION_ID"))
+        return _redact(title)[:TITLE_CHARS] if title else UNTITLED
+    except Exception:
+        return UNTITLED
+
+
+def make_pre_approval_request(ctx):
+    def pre_approval_request(request_id=None, session_id=None, surface=None, **_):
+        # present() runs on a worker thread with no session context, so the title is read here.
+        if surface != SURFACE or not ctx.get_config("away", False):
+            return
+        title = _lookup_title(session_id)
+        with _lock:
+            _titles[request_id] = title
+            while len(_titles) > MAX_TITLES:
+                _titles.popitem(last=False)
+    return pre_approval_request
+
+
+def post_approval_response(request_id=None, surface=None, **_):
+    # Still open here means the host gave up first (interrupted, busy or timed out).
+    if surface != SURFACE:
+        return
+    with _lock:
+        entry = _pending.pop(request_id, None)
+    if entry is not None:
+        _settle(entry, "deny", CLOSED)
+
+
+def _window(seconds):
+    if seconds >= 60:
+        minutes = round(seconds / 60)
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+    return f"{round(seconds)} seconds"
+
+
+def approval_card(request, title, window):
+    """The card text and whether the command was clipped."""
+    command = re.sub(r"`(?=``)", "`\u200b", request.command)  # a zero-width space breaks every run of 3 backticks
+    clipped = len(command) > COMMAND_CHARS
+    if clipped:
+        command = f"{command[:COMMAND_CHARS]}\n{CUT_SHORT}"
+    text = APPROVAL_CARD.format(title=title, command=command, window=window,
+                                description=_redact(request.description)[:DESCRIPTION_CHARS])
+    return (f"{text}\n{TOO_LONG}" if clipped else text), clipped
+
+
+def _settle(entry, choice, line):
+    """Resolve an open card once. False if something resolved it first."""
+    with _lock:
+        if entry.done:
+            return False
+        entry.done, entry.choice = True, choice
+    entry.event.set()
+    if entry.message is not None:
+        try:
+            connection.submit(connection.edit_card(entry.message, f"{entry.text}\n\n{line}"))
+        except Exception:
+            logger.warning("discord-approval: could not edit the card")
+    return True
+
+
+async def on_approval_click(interaction, parts):
+    request_id, choice = parts[0], parts[-1]
+    with _lock:
+        entry = _pending.get(request_id)
+        won = entry is not None and not entry.done and choice in entry.choices
+        if won:
+            entry.done, entry.choice = True, choice
+    if not won:
+        await connection.close_card(interaction)
+        return
+    entry.event.set()
+    line = {"once": ALLOWED_ONCE, "session": ALLOWED_SESSION, "deny": DENIED}[choice]
+    try:
+        await interaction.response.edit_message(content=f"{interaction.message.content}\n\n{line}", view=None)
+    except Exception as e:
+        # The choice stands, so say so: the card keeps its buttons and a second click gets CLOSED.
+        logger.warning("discord-approval: choice taken but the card edit failed (%s)", type(e).__name__)
+
+
+connection.ROUTES["a"] = on_approval_click
+
+
+def make_present(ctx):
+    def present(request):
+        start = monotonic()  # the host's clock started about now, so every deadline counts from here
+        if not ctx.get_config("away", False) or not connection.in_gateway() or not connection.user_id():
+            raise PassThrough("away is off")
+        connection.ready(READY_WAIT_S)
+        deadline = start + max(10, request.timeout_seconds - DEADLINE_MARGIN_S)  # ends before the host gives up
+        with _lock:
+            title = _titles.pop(request.request_id, UNTITLED)
+        text, clipped = approval_card(request, title, _window(max(1, deadline - monotonic())))
+        # A clipped command hides its tail, so it can only be denied here.
+        choices = ["deny"] if clipped else [c for c in ("once", "session", "deny") if c in request.allowed_choices]  # never "always"
+        entry = Entry(text, choices)
+        buttons = [(label, f"{connection.PREFIX}a:{request.request_id}:{c}", style) for c, label, style in (
+            ("once", BTN_ONCE, "success"), ("session", BTN_SESSION, "secondary"), ("deny", BTN_DENY, "danger"),
+        ) if c in choices]
+        with _lock:
+            _pending[request.request_id] = entry
+        try:
+            entry.message = connection.run(connection.send_dm(entry.text, buttons), 10)
+        except Exception:
+            with _lock:
+                _pending.pop(request.request_id, None)
+            raise
+        while not entry.event.wait(0.5):
+            if not ctx.get_config("away", False):
+                if _settle(entry, None, MOVED_TO_TERMINAL):
+                    raise PassThrough("away turned off")
+            elif monotonic() > deadline:
+                _settle(entry, "deny", TIMED_OUT)
+        return request.respond(entry.choice)
+    return present
+
+
+_questions = {}  # prompt_id -> Entry, removed when answered or settled
+
+
+def _on():
+    return connection.in_gateway() and connection.user_id()
+
+
+async def _send_question(entry, buttons, select):
+    entry.message = await connection.send_dm(entry.text, buttons, select)
+    if entry.done:  # settled while the card was still being sent
+        await connection.edit_card(entry.message, f"{entry.text}\n\n{CLOSED}")
+
+
+def _open_question(session_id, prompt_id):
+    from tools import clarify_gateway
+    pending = clarify_gateway.get_pending(prompt_id)
+    if pending is None:
+        return
+    question = _redact(pending.question)[:QUESTION_CHARS]
+    labels = [_redact(c)[:LABEL_CHARS] for c in pending.choices or []]
+    if len(labels) > MAX_LABELS or not all(label.strip() for label in labels):
+        labels = []  # Discord allows 24 choices and no empty label, so the card falls back to Answer only
+    cid = f"{connection.PREFIX}c:{prompt_id}"
+    select = None
+    if pending.multi_select and labels:
+        buttons = []
+        select = (SELECT_HINT, f"{connection.PREFIX}cs:{prompt_id}", list(zip(labels, map(str, range(len(labels))))))
+    else:
+        buttons = [(label, f"{cid}:{n}", "primary") for n, label in enumerate(labels)]
+    buttons.append((ANSWER_BUTTON, f"{cid}:answer", "secondary"))
+    # entry.choices keeps the real labels: the card shows redacted ones, the answer must be exact.
+    entry = Entry(QUESTION_CARD.format(title=_lookup_title(session_id), question=question), list(pending.choices or []))
+    with _lock:
+        _questions[prompt_id] = entry
+    try:
+        connection.submit(_send_question(entry, buttons, select))
+    except Exception:
+        with _lock:
+            _questions.pop(prompt_id, None)
+        raise
+
+
+def _open_entry(prompt_id):
+    with _lock:
+        entry = _questions.get(prompt_id)
+        return entry if entry is not None and not entry.done else None
+
+
+async def _answer(interaction, prompt_id, answer):
+    from tools import clarify_gateway
+    with _lock:
+        entry = _questions.pop(prompt_id, None)
+        if entry is not None:
+            entry.done = True
+    ok = entry is not None and clarify_gateway.resolve_gateway_clarify(prompt_id, answer)
+    line = ANSWERED.format(answer=answer[:ANSWER_CHARS]) if ok else CLOSED
+    await interaction.response.edit_message(content=f"{interaction.message.content}\n\n{line}", view=None)
+
+
+def _answer_modal(prompt_id):
+    import discord
+    modal = discord.ui.Modal(title=MODAL_TITLE, custom_id=f"{connection.PREFIX}cm:{prompt_id}")
+    field = discord.ui.TextInput(label=MODAL_LABEL, style=discord.TextStyle.paragraph, max_length=MODAL_CHARS, custom_id=ANSWER_ID)
+    modal.add_item(field)
+    return modal, field
+
+
+async def on_clarify_click(interaction, parts):
+    prompt_id, what = parts[0], parts[-1]
+    entry = _open_entry(prompt_id)
+    if entry is None:
+        await connection.close_card(interaction)
+    elif what == "answer":
+        modal, _ = _answer_modal(prompt_id)
+        await interaction.response.send_modal(modal)
+    elif what.isascii() and what.isdigit() and int(what) < len(entry.choices):
+        await _answer(interaction, prompt_id, entry.choices[int(what)])
+    else:
+        await connection.close_card(interaction)
+
+
+async def on_clarify_select(interaction, parts):
+    entry = _open_entry(parts[0])
+    values = interaction.data.get("values") or []
+    if entry is None or not values or not all(v.isascii() and v.isdigit() and int(v) < len(entry.choices) for v in values):
+        await connection.close_card(interaction)
+        return
+    await _answer(interaction, parts[0], json.dumps([entry.choices[int(v)] for v in values], ensure_ascii=False))
+
+
+async def on_clarify_modal(interaction, parts):
+    if _open_entry(parts[0]) is None:
+        await connection.close_card(interaction)
+        return
+    # Rebuild the modal and let discord.py fill the TextInput from the submitted payload.
+    modal, field = _answer_modal(parts[0])
+    modal._refresh(interaction, interaction.data["components"], {})
+    answer = field.value.strip()
+    if not answer:
+        await interaction.response.send_message(EMPTY_ANSWER, ephemeral=True)  # the card stays open
+        return
+    await _answer(interaction, parts[0], answer)
+
+
+connection.ROUTES["c"] = on_clarify_click
+connection.ROUTES["cs"] = on_clarify_select
+connection.ROUTES["cm"] = on_clarify_modal
+
+
+def make_prompt_hooks(ctx):
+    def on_session_prompt(session_id=None, kind=None, prompt_id=None, **_):
+        if kind not in ("approval", "clarify") or not ctx.get_config("away", False) or not _on():
+            return
+        try:
+            if kind == "clarify":
+                _open_question(session_id, prompt_id)
+            else:
+                # Profile-routed subagents use the builtin queue, so all we can do is say one is waiting.
+                connection.submit(connection.send_dm(SUBAGENT_WAITING.format(title=_lookup_title(session_id))))
+        except PassThrough:
+            pass
+
+    def on_session_prompt_settled(prompt_id=None, **_):
+        with _lock:
+            entry = _questions.pop(prompt_id, None)
+        if entry is not None:
+            _settle(entry, None, CLOSED)
+
+    return on_session_prompt, on_session_prompt_settled
+
+
+_starts = {}  # turn_id -> (monotonic start, session_id), top-level turns only
+_replies = {}  # turn_id -> (monotonic time, reply)
+
+
+def _duration(seconds):
+    minutes = int(seconds // 60)
+    return f"{minutes} min" if minutes < 60 else f"{minutes // 60} h {minutes % 60} min"
+
+
+def _excerpt(reply):
+    lines = [line.strip() for line in _redact(reply).splitlines() if line.strip()][:REPLY_LINES]
+    return "\n".join(f"> {line}" for line in "\n".join(lines)[:REPLY_CHARS].splitlines())
+
+
+def make_ping_hooks(ctx):
+    def pre_llm_call(session_id=None, turn_id=None, parent_session_id=None, **_):
+        now = monotonic()
+        with _lock:
+            for table in (_starts, _replies):
+                for key in [k for k, v in table.items() if now - v[0] > MAX_AGE_S]:
+                    del table[key]
+            if turn_id and not parent_session_id:
+                _starts[turn_id] = (now, session_id)
+
+    def post_llm_call(turn_id=None, assistant_response=None, **_):
+        with _lock:
+            if turn_id in _starts:
+                _replies[turn_id] = (monotonic(), str(assistant_response or ""))
+
+    def on_session_end(turn_id=None, completed=None, failed=None, interrupted=None, **_):
+        with _lock:
+            started = _starts.pop(turn_id, None)
+            reply = _replies.pop(turn_id, (0, ""))[1]
+        if started is None or not ctx.get_config("ping", False) or not _on():
+            return
+        seconds = monotonic() - started[0]
+        if seconds < PING_AFTER_S:
+            return
+        outcome = "interrupted" if interrupted else "failed" if failed else "completed"
+        text = PING.format(outcome=OUTCOME[outcome], duration=_duration(seconds), title=_lookup_title(started[1]))
+        excerpt = _excerpt(reply)
+        try:
+            connection.submit(connection.send_dm(f"{text}\n{excerpt}" if excerpt else text))
+        except PassThrough:
+            pass
+
+    return pre_llm_call, post_llm_call, on_session_end

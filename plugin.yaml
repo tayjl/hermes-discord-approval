@@ -1,0 +1,8 @@
+name: discord-approval
+version: 0.1.0
+description: Send approvals and questions to your Discord DM while away
+requires_env:
+  - name: DISCORD_BOT_TOKEN
+    secret: true
+  - name: DISCORD_ALLOWED_USERS
+    description: Your Discord user id (exactly one)
